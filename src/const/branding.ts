@@ -5,7 +5,7 @@
 export const LOBE_CHAT_CLOUD = 'AI Cloud';
 
 export const BRANDING_NAME = 'AI';
-export const BRANDING_LOGO_URL = '';
+export const BRANDING_LOGO_URL = '/icons/icon-192x192.png';
 
 export const ORG_NAME = 'AI';
 
