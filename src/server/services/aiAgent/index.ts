@@ -13,6 +13,7 @@ import { LOADING_FLAT } from '@lobechat/const';
 import type {
   AgentManagementContext,
   LobeToolManifest,
+  ToolExecutor,
   ToolSource,
 } from '@lobechat/context-engine';
 import { SkillEngine } from '@lobechat/context-engine';
@@ -36,6 +37,7 @@ import debug from 'debug';
 import { AgentModel } from '@/database/models/agent';
 import { AgentSkillModel } from '@/database/models/agentSkill';
 import { AiModelModel } from '@/database/models/aiModel';
+import { FileModel } from '@/database/models/file';
 import { MessageModel } from '@/database/models/message';
 import { PluginModel } from '@/database/models/plugin';
 import { ThreadModel } from '@/database/models/thread';
@@ -225,6 +227,7 @@ export class AiAgentService {
       botPlatformContext,
       discordContext,
       existingMessageIds = [],
+      fileIds: attachedFileIds,
       files,
       functionTools,
       hooks,
@@ -455,6 +458,7 @@ export class AiAgentService {
     };
     const toolManifestMap: Record<string, any> = {};
     const toolSourceMap: Record<string, ToolSource> = {};
+    const toolExecutorMap: Record<string, ToolExecutor> = {};
     let onlineDevices: DeviceAttachment[] = [];
     let activeDeviceId: string | undefined;
     let hasAgentDocuments = false;
@@ -884,7 +888,11 @@ export class AiAgentService {
 
     await throwIfExecutionAborted('message history loading');
 
-    // 12. Upload external files to S3 and collect file IDs
+    // 12. Collect Phase 2 warnings (ingestion/parsing errors) alongside Phase 1 warnings
+    // Phase 1 warnings (e.g. file too large) are already in botPlatformContext.warnings
+    const warnings: string[] = [];
+
+    // 13. Upload external files to S3 and collect file IDs
     let fileIds: string[] | undefined;
     let imageList: Array<{ alt: string; id: string; url: string }> | undefined;
     let videoList: ChatVideoItem[] | undefined;
@@ -938,6 +946,9 @@ export class AiAgentService {
               result.fileId,
               parseError,
             );
+            warnings.push(
+              `File "${file.name || 'unknown'}" was uploaded but its contents could not be extracted.`,
+            );
           }
 
           fileList.push({
@@ -950,6 +961,7 @@ export class AiAgentService {
           });
         } catch (error) {
           log('execAgent: failed to ingest file %s: %O', file.name || file.url, error);
+          warnings.push(`File "${file.name || 'unknown'}" could not be uploaded and was skipped.`);
         }
       }
 
@@ -965,6 +977,106 @@ export class AiAgentService {
       if (imageList.length === 0) imageList = undefined;
       if (videoList.length === 0) videoList = undefined;
       if (fileList.length === 0) fileList = undefined;
+    }
+
+    // 13b. Attach already-uploaded files referenced by fileIds (e.g. SPA Gateway mode).
+    // These files are already in the `files` table; resolve URLs + classify, and
+    // merge into the imageList/videoList/fileList passed to the LLM and stored
+    // as message relations via messagesFiles.
+    if (attachedFileIds && attachedFileIds.length > 0) {
+      await throwIfExecutionAborted('file resolution');
+
+      // Dedupe while preserving caller order. messages_files has a composite PK
+      // on (file_id, message_id), so duplicate fileIds would violate the
+      // constraint on messageModel.create and abort the whole send.
+      const dedupedFileIds = Array.from(new Set(attachedFileIds));
+
+      const fileModel = new FileModel(this.db, this.userId);
+      const fileRecords = await fileModel.findByIds(dedupedFileIds);
+
+      if (fileRecords.length > 0) {
+        fileIds = fileIds ?? [];
+        imageList = imageList ?? [];
+        videoList = videoList ?? [];
+        fileList = fileList ?? [];
+
+        const documentService = new DocumentService(this.db, this.userId);
+
+        // Preserve caller's ordering of fileIds so rendering matches upload order.
+        const recordById = new Map(fileRecords.map((f) => [f.id, f]));
+
+        for (const id of dedupedFileIds) {
+          const file = recordById.get(id);
+          if (!file) {
+            warnings.push(`Attachment "${id}" was not found and skipped.`);
+            continue;
+          }
+
+          fileIds.push(file.id);
+          const resolvedUrl = (await fileService.getFullFileUrl(file.url)) || file.url;
+          const fileType = file.fileType || '';
+
+          if (fileType.startsWith('image')) {
+            imageList.push({
+              alt: file.name || 'image',
+              id: file.id,
+              url: resolvedUrl,
+            });
+            continue;
+          }
+
+          if (fileType.startsWith('video')) {
+            videoList.push({
+              alt: file.name || 'video',
+              id: file.id,
+              url: resolvedUrl,
+            });
+            continue;
+          }
+
+          // Non-image / non-video: ensure the document content is parsed so
+          // MessageContentProcessor can inject it via filesPrompts(). parseFile
+          // is idempotent — returns cached content when the document already exists.
+          let content: string | undefined;
+          try {
+            const document = await documentService.parseFile(file.id);
+            content = document.content ?? undefined;
+          } catch (parseError) {
+            log(
+              'execAgent: parseFile failed for attached file %s (id=%s): %O',
+              file.name,
+              file.id,
+              parseError,
+            );
+            warnings.push(
+              `File "${file.name || 'unknown'}" was attached but its contents could not be extracted.`,
+            );
+          }
+
+          fileList.push({
+            content,
+            fileType: fileType || 'application/octet-stream',
+            id: file.id,
+            name: file.name || 'file',
+            size: file.size ?? 0,
+            url: resolvedUrl,
+          });
+        }
+
+        log(
+          'execAgent: resolved %d attached file(s) (%d images, %d videos, %d documents)',
+          fileRecords.length,
+          imageList.length,
+          videoList.length,
+          fileList.length,
+        );
+
+        if (imageList.length === 0) imageList = undefined;
+        if (videoList.length === 0) videoList = undefined;
+        if (fileList.length === 0) fileList = undefined;
+      } else {
+        log('execAgent: no file records found for attachedFileIds=%O', dedupedFileIds);
+      }
     }
 
     await throwIfExecutionAborted('message creation');
@@ -999,6 +1111,13 @@ export class AiAgentService {
     });
     log('execAgent: created assistant message %s', assistantMessageRecord.id);
     assistantMessageRef.current = assistantMessageRecord.id;
+
+    // Append Phase 2 warnings (ingestion/parsing errors) to botPlatformContext
+    // so the context engine can inject them alongside Phase 1 warnings
+    if (warnings.length > 0 && botPlatformContext) {
+      const existing = (botPlatformContext as any).warnings as string[] | undefined;
+      (botPlatformContext as any).warnings = [...(existing ?? []), ...warnings];
+    }
 
     // Create user message object for processing.
     // - imageList: vision models render these as image_url parts
@@ -1126,6 +1245,7 @@ export class AiAgentService {
         stream,
         toolSet: {
           enabledToolIds: toolsResult.enabledToolIds,
+          executorMap: toolExecutorMap,
           manifestMap: toolManifestMap,
           sourceMap: toolSourceMap,
           tools,

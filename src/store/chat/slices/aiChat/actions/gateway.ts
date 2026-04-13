@@ -106,20 +106,39 @@ export class GatewayActionImpl {
       );
     });
 
-    // Forward agent events to caller
-    if (onEvent) {
-      client.on('agent_event', onEvent);
-    }
+    // Track whether a terminal agent event was received (agent_runtime_end or error),
+    // so we can fire onSessionComplete from the subsequent disconnect.
+    // session_complete is handled separately as an explicit server signal.
+    let receivedTerminalEvent = false;
+    let sessionCompleted = false;
+    const fireSessionComplete = () => {
+      if (sessionCompleted) return;
+      sessionCompleted = true;
+      onSessionComplete?.();
+    };
+
+    // Forward agent events to caller, and track terminal events
+    client.on('agent_event', (event) => {
+      if (event.type === 'agent_runtime_end' || event.type === 'error') {
+        receivedTerminalEvent = true;
+      }
+      onEvent?.(event);
+    });
 
     // Handle session completion
     client.on('session_complete', () => {
       this.internal_cleanupGatewayConnection(operationId);
-      onSessionComplete?.();
+      fireSessionComplete();
     });
 
-    // Handle disconnection (terminal events auto-disconnect the client)
+    // Handle disconnection — only fire session complete if a terminal agent event
+    // was received (agent_runtime_end / error). Auth failures, explicit disconnect(),
+    // and other non-terminal disconnects should NOT trigger onSessionComplete.
     client.on('disconnected', () => {
       this.internal_cleanupGatewayConnection(operationId);
+      if (receivedTerminalEvent) {
+        fireSessionComplete();
+      }
     });
 
     // Handle auth failures
@@ -187,13 +206,15 @@ export class GatewayActionImpl {
    */
   executeGatewayAgent = async (params: {
     context: ConversationContext;
+    /** File IDs of already-uploaded attachments to attach to the new user message */
+    fileIds?: string[];
     message: string;
     /** Called when the gateway session completes (agent finished running) */
     onComplete?: () => void;
     /** Parent message ID for regeneration/continue (skip user message creation, branch from this message) */
     parentMessageId?: string;
   }): Promise<ExecAgentResult> => {
-    const { context, message, onComplete, parentMessageId } = params;
+    const { context, fileIds, message, onComplete, parentMessageId } = params;
 
     const agentGatewayUrl =
       window.global_serverConfigStore!.getState().serverConfig.agentGatewayUrl!;
@@ -208,6 +229,7 @@ export class GatewayActionImpl {
         threadId: context.threadId,
         topicId: context.topicId,
       },
+      fileIds,
       parentMessageId,
       prompt: message,
     });

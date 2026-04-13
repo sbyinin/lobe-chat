@@ -312,6 +312,7 @@ export class AgentRuntimeService {
         status: 'idle',
         stepCount: initialStepCount,
         // Backward-compat: resolved tool fields read by RuntimeExecutors
+        toolExecutorMap: operationToolSet.executorMap,
         toolManifestMap: operationToolSet.manifestMap,
         toolSourceMap: operationToolSet.sourceMap,
         tools: operationToolSet.tools,
@@ -1606,6 +1607,29 @@ export class AgentRuntimeService {
       // Also dispatch onError hooks if reason is error
       if (reason === 'error') {
         await hookDispatcher.dispatch(operationId, 'onError', event, metadata._hooks);
+
+        // Persist error into the assistant message so the frontend can display it
+        // after fetching messages from DB. Without this, the message stays with
+        // placeholder content and no error indicator.
+        const assistantMessageId = metadata?.assistantMessageId;
+        if (assistantMessageId && state?.error) {
+          const errorMessage = this.extractErrorMessage(state.error) || String(state.error);
+          try {
+            await this.messageModel.update(assistantMessageId, {
+              error: {
+                body: { message: errorMessage },
+                message: errorMessage,
+                type: 'AgentRuntimeError',
+              },
+            });
+          } catch (updateError) {
+            log(
+              '[%s] Failed to update assistant message with error (non-fatal): %O',
+              operationId,
+              updateError,
+            );
+          }
+        }
       }
 
       // Cleanup hooks after completion
