@@ -39,6 +39,7 @@ import { serverMessagesEngine } from '@/server/modules/Mecha/ContextEngineering'
 import { type EvalContext } from '@/server/modules/Mecha/ContextEngineering/types';
 import { initModelRuntimeFromDB } from '@/server/modules/ModelRuntime';
 import { AgentDocumentsService } from '@/server/services/agentDocuments';
+import { FileService } from '@/server/services/file';
 import { MessageService } from '@/server/services/message';
 import { OnboardingService } from '@/server/services/onboarding';
 import {
@@ -46,6 +47,7 @@ import {
   type ToolExecutionService,
 } from '@/server/services/toolExecution';
 
+import { dispatchClientTool } from './dispatchClientTool';
 import { classifyLLMError, type LLMErrorKind } from './llmErrorClassification';
 import { type IStreamEventManager } from './types';
 
@@ -87,6 +89,26 @@ const getToolFailureKind = (result: ToolExecutionResultResponse): ToolFailureKin
 
 const shouldRetryTool = (kind: ToolFailureKind | undefined, attempt: number, maxRetries: number) =>
   kind === 'retry' && attempt <= maxRetries;
+
+// Builds a postProcessUrl callback that resolves S3 keys in file-backed fields
+// (imageList, videoList, fileList) to absolute URLs. Must be passed to every
+// messageModel.query() call whose output is later fed to the LLM — otherwise
+// the provider layer receives raw keys like `files/user_xxx/icon.png` and
+// rejects them (see anthropic contextBuilder `Invalid image URL`).
+//
+// FileService is constructed lazily so environments without S3 config (unit
+// tests) don't fail at context-build time; failure returns undefined, which
+// leaves URLs as raw keys — same behavior as before this helper existed.
+const buildPostProcessUrl = (ctx: Pick<RuntimeExecutorContext, 'serverDB' | 'userId'>) => {
+  if (!ctx.userId || !ctx.serverDB) return undefined;
+  let fileService: FileService | undefined;
+  try {
+    fileService = new FileService(ctx.serverDB, ctx.userId);
+  } catch {
+    return undefined;
+  }
+  return (path: string | null) => fileService!.getFullFileUrl(path);
+};
 
 const shouldRetryLLM = (kind: LLMErrorKind, attempt: number, maxRetries: number) =>
   kind === 'retry' && attempt <= maxRetries;
@@ -216,7 +238,6 @@ export interface RuntimeExecutorContext {
   botPlatformContext?: any;
   discordContext?: any;
   evalContext?: EvalContext;
-  fileService?: any;
   loadAgentState?: (operationId: string) => Promise<AgentState | null>;
   messageModel: MessageModel;
   operationId: string;
@@ -372,11 +393,14 @@ export const createRuntimeExecutors = (
             async (topicId) => topicModel.findById(topicId),
             async (topicId) => {
               const topic = await topicModel.findById(topicId);
-              return messageModel.query({
-                agentId: topic?.agentId ?? undefined,
-                groupId: topic?.groupId ?? undefined,
-                topicId,
-              });
+              return messageModel.query(
+                {
+                  agentId: topic?.agentId ?? undefined,
+                  groupId: topic?.groupId ?? undefined,
+                  topicId,
+                },
+                { postProcessUrl: buildPostProcessUrl(ctx) },
+              );
             },
           );
         }
@@ -1059,11 +1083,14 @@ export const createRuntimeExecutors = (
     }
 
     try {
-      const dbMessages = await ctx.messageModel.query({
-        agentId: state.metadata?.agentId,
-        threadId: state.metadata?.threadId,
-        topicId,
-      });
+      const dbMessages = await ctx.messageModel.query(
+        {
+          agentId: state.metadata?.agentId,
+          threadId: state.metadata?.threadId,
+          topicId,
+        },
+        { postProcessUrl: buildPostProcessUrl(ctx) },
+      );
 
       const messageIds = dbMessages
         .filter(
@@ -1346,28 +1373,51 @@ export const createRuntimeExecutors = (
         ),
       };
 
-      // Execute tool using ToolExecutionService
-      log(`[${operationLogId}] Executing tool ${toolName} ...`);
-      const execution = await executeToolWithRetry(
-        () =>
-          toolExecutionService.executeTool(chatToolPayload, {
-            activeDeviceId: state.metadata?.activeDeviceId,
-            agentId: state.metadata?.agentId,
-            memoryToolPermission: agentConfig?.chatConfig?.memory?.toolPermission,
-            serverDB: ctx.serverDB,
-            taskId: state.metadata?.taskId,
-            toolManifestMap: effectiveManifestMap,
-            toolResultMaxLength,
-            topicId: ctx.topicId,
-            userId: ctx.userId,
-          }),
-        {
-          isInterrupted: () => isOperationInterrupted(ctx),
-          maxRetries: TOOL_MAX_RETRIES,
-          operationLogId,
-          toolName,
-        },
-      );
+      // Route to client via Agent Gateway WS when the tool is marked
+      // executor='client' and the current stream manager can reach a gateway.
+      // Falls through to the normal server path if either is unavailable.
+      const canDispatchToClient =
+        chatToolPayload.executor === 'client' &&
+        typeof streamManager.sendToolExecute === 'function';
+
+      let execution: { result: ToolExecutionResultResponse; attempts: number };
+      if (canDispatchToClient) {
+        log(`[${operationLogId}] Dispatching tool ${toolName} to client via Agent Gateway`);
+        const dispatchResult = await dispatchClientTool(chatToolPayload, {
+          operationId,
+          streamManager,
+        });
+        execution = { attempts: 1, result: dispatchResult };
+      } else {
+        // Inject source from sourceMap so BuiltinToolsExecutor can route
+        // lobehubSkill / klavis tools correctly (LLM responses don't carry source)
+        if (toolSource && !chatToolPayload.source) {
+          chatToolPayload.source = toolSource;
+        }
+
+        // Execute tool using ToolExecutionService
+        log(`[${operationLogId}] Executing tool ${toolName} ...`);
+        execution = await executeToolWithRetry(
+          () =>
+            toolExecutionService.executeTool(chatToolPayload, {
+              activeDeviceId: state.metadata?.activeDeviceId,
+              agentId: state.metadata?.agentId,
+              memoryToolPermission: agentConfig?.chatConfig?.memory?.toolPermission,
+              serverDB: ctx.serverDB,
+              taskId: state.metadata?.taskId,
+              toolManifestMap: effectiveManifestMap,
+              toolResultMaxLength,
+              topicId: ctx.topicId,
+              userId: ctx.userId,
+            }),
+          {
+            isInterrupted: () => isOperationInterrupted(ctx),
+            maxRetries: TOOL_MAX_RETRIES,
+            operationLogId,
+            toolName,
+          },
+        );
+      }
 
       const executionResult = execution.result;
       const executionTime = executionResult.executionTime;
@@ -1626,26 +1676,49 @@ export const createRuntimeExecutors = (
 
           const batchAgentConfig = state.metadata?.agentConfig;
 
-          const execution = await executeToolWithRetry(
-            () =>
-              toolExecutionService.executeTool(chatToolPayload, {
-                activeDeviceId: state.metadata?.activeDeviceId,
-                agentId: state.metadata?.agentId,
-                memoryToolPermission: batchAgentConfig?.chatConfig?.memory?.toolPermission,
-                serverDB: ctx.serverDB,
-                taskId: state.metadata?.taskId,
-                toolManifestMap: batchManifestMap,
-                toolResultMaxLength: batchAgentConfig?.chatConfig?.toolResultMaxLength,
-                topicId: ctx.topicId,
-                userId: ctx.userId,
-              }),
-            {
-              isInterrupted: () => isOperationInterrupted(ctx),
-              maxRetries: TOOL_MAX_RETRIES,
-              operationLogId,
-              toolName,
-            },
-          );
+          const canDispatchToClient =
+            chatToolPayload.executor === 'client' &&
+            typeof streamManager.sendToolExecute === 'function';
+
+          let execution: { result: ToolExecutionResultResponse; attempts: number };
+          if (canDispatchToClient) {
+            log(`[${operationLogId}] Dispatching tool ${toolName} to client via Agent Gateway`);
+            const dispatchResult = await dispatchClientTool(chatToolPayload, {
+              operationId,
+              streamManager,
+            });
+            execution = { attempts: 1, result: dispatchResult };
+          } else {
+            // Inject source from sourceMap so BuiltinToolsExecutor can route
+            // lobehubSkill / klavis tools correctly (LLM responses don't carry source)
+            const batchToolSource =
+              state.operationToolSet?.sourceMap?.[chatToolPayload.identifier] ??
+              state.toolSourceMap?.[chatToolPayload.identifier];
+            if (batchToolSource && !chatToolPayload.source) {
+              chatToolPayload.source = batchToolSource;
+            }
+
+            execution = await executeToolWithRetry(
+              () =>
+                toolExecutionService.executeTool(chatToolPayload, {
+                  activeDeviceId: state.metadata?.activeDeviceId,
+                  agentId: state.metadata?.agentId,
+                  memoryToolPermission: batchAgentConfig?.chatConfig?.memory?.toolPermission,
+                  serverDB: ctx.serverDB,
+                  taskId: state.metadata?.taskId,
+                  toolManifestMap: batchManifestMap,
+                  toolResultMaxLength: batchAgentConfig?.chatConfig?.toolResultMaxLength,
+                  topicId: ctx.topicId,
+                  userId: ctx.userId,
+                }),
+              {
+                isInterrupted: () => isOperationInterrupted(ctx),
+                maxRetries: TOOL_MAX_RETRIES,
+                operationLogId,
+                toolName,
+              },
+            );
+          }
 
           const executionResult = execution.result;
           const executionTime = executionResult.executionTime;
@@ -1784,11 +1857,17 @@ export const createRuntimeExecutors = (
     // Query latest messages from database
     // Must pass agentId to ensure correct query scope, otherwise when topicId is undefined,
     // the query will use isNull(topicId) condition which won't find messages with actual topicId
-    const latestMessages = await ctx.messageModel.query({
-      agentId: state.metadata?.agentId,
-      threadId: state.metadata?.threadId,
-      topicId: state.metadata?.topicId,
-    });
+    //
+    // postProcessUrl resolves S3 keys in imageList/videoList/fileList to absolute URLs;
+    // without it the next LLM call sees raw keys and providers reject them.
+    const latestMessages = await ctx.messageModel.query(
+      {
+        agentId: state.metadata?.agentId,
+        threadId: state.metadata?.threadId,
+        topicId: state.metadata?.topicId,
+      },
+      { postProcessUrl: buildPostProcessUrl(ctx) },
+    );
 
     // Use conversation-flow parse to resolve branching into linear flat list
     // parse() handles assistantGroup, compare, supervisor, etc. virtual message types
