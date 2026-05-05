@@ -1,6 +1,7 @@
 import type { AgentRuntimeContext, AgentState } from '@lobechat/agent-runtime';
 import { BUILTIN_AGENT_SLUGS, getAgentRuntimeConfig } from '@lobechat/builtin-agents';
 import { builtinSkills } from '@lobechat/builtin-skills';
+import { LobeAgentManifest } from '@lobechat/builtin-tool-lobe-agent';
 import { LocalSystemManifest } from '@lobechat/builtin-tool-local-system';
 import { MessageToolIdentifier } from '@lobechat/builtin-tool-message';
 import { PageAgentIdentifier } from '@lobechat/builtin-tool-page-agent';
@@ -9,6 +10,7 @@ import {
   generateSystemPrompt,
   RemoteDeviceManifest,
 } from '@lobechat/builtin-tool-remote-device';
+import { TaskIdentifier } from '@lobechat/builtin-tool-task';
 import { builtinTools, manualModeExcludeToolIds } from '@lobechat/builtin-tools';
 import { LOADING_FLAT } from '@lobechat/const';
 import type {
@@ -19,6 +21,7 @@ import type {
 } from '@lobechat/context-engine';
 import { SkillEngine } from '@lobechat/context-engine';
 import type { LobeChatDatabase } from '@lobechat/database';
+import { buildTaskManagerDefaultsPrompt } from '@lobechat/prompts';
 import type {
   ChatFileItem,
   ChatTopicBotContext,
@@ -42,10 +45,12 @@ import { AiModelModel } from '@/database/models/aiModel';
 import { FileModel } from '@/database/models/file';
 import { MessageModel } from '@/database/models/message';
 import { PluginModel } from '@/database/models/plugin';
+import { TaskModel } from '@/database/models/task';
 import { ThreadModel } from '@/database/models/thread';
 import { TopicModel } from '@/database/models/topic';
 import { UserModel } from '@/database/models/user';
 import { UserPersonaModel } from '@/database/models/userMemory/persona';
+import { toolsEnv } from '@/envs/tools';
 import { shouldEnableBuiltinSkill } from '@/helpers/skillFilters';
 import { signUserJWT } from '@/libs/trpc/utils/internalJwt';
 import {
@@ -97,6 +102,35 @@ function formatErrorForMetadata(error: unknown): Record<string, any> | undefined
   return { message: String(error) };
 }
 
+const getVisualAvailabilityFromFileTypes = (fileTypes: string[]) => ({
+  hasImages: fileTypes.some((fileType) => fileType.startsWith('image')),
+  hasVideos: fileTypes.some((fileType) => fileType.startsWith('video')),
+});
+
+interface VisualAvailabilityMessage {
+  imageList?: unknown[];
+  role?: string;
+  videoList?: unknown[];
+}
+
+const getVisualAvailabilityFromMessages = (messages: VisualAvailabilityMessage[]) => ({
+  hasImages: messages.some(
+    (message) => message.role === 'user' && (message.imageList?.length ?? 0) > 0,
+  ),
+  hasVideos: messages.some(
+    (message) => message.role === 'user' && (message.videoList?.length ?? 0) > 0,
+  ),
+});
+
+const isVisualUnderstandingConfigured = () => {
+  try {
+    return !!toolsEnv.VISUAL_UNDERSTANDING_PROVIDER && !!toolsEnv.VISUAL_UNDERSTANDING_MODEL;
+  } catch {
+    // The env proxy rejects server-only keys in client-like runtimes; treat that as disabled.
+    return false;
+  }
+};
+
 /**
  * Internal params for execAgent with step lifecycle callbacks
  * This extends the public ExecAgentParams with server-side only options
@@ -110,6 +144,8 @@ interface InternalExecAgentParams extends ExecAgentParams {
   botPlatformContext?: any;
   /** Cron job ID that triggered this execution (if trigger is 'cron') */
   cronJobId?: string;
+  /** Disable only local-system while preserving other tools. Useful for signal-only evals. */
+  disableLocalSystem?: boolean;
   /** Disable all tools (no plugins, no system manifests). Useful for eval/benchmark scenarios. */
   disableTools?: boolean;
   /** Discord context for injecting channel/guild info into agent system message */
@@ -195,6 +231,7 @@ export class AiAgentService {
   private readonly agentService: AgentService;
   private readonly messageModel: MessageModel;
   private readonly pluginModel: PluginModel;
+  private readonly taskModel: TaskModel;
   private readonly threadModel: ThreadModel;
   private readonly topicModel: TopicModel;
   private readonly agentRuntimeService: AgentRuntimeService;
@@ -213,11 +250,23 @@ export class AiAgentService {
     this.agentService = new AgentService(db, userId);
     this.messageModel = new MessageModel(db, userId);
     this.pluginModel = new PluginModel(db, userId);
+    this.taskModel = new TaskModel(db, userId);
     this.threadModel = new ThreadModel(db, userId);
     this.topicModel = new TopicModel(db, userId);
     this.agentRuntimeService = new AgentRuntimeService(db, userId, options?.runtimeOptions);
     this.marketService = new MarketService({ userInfo: { userId } });
     this.klavisService = new KlavisService({ db, userId });
+  }
+
+  private async resolveOperationTaskId(
+    idOrIdentifier?: string | null,
+  ): Promise<string | undefined> {
+    if (!idOrIdentifier) return;
+
+    // Task detail routes use human-readable identifiers such as `T-1`, while
+    // operation runtimes store this value in FK-backed records.
+    const task = await this.taskModel.resolve(idOrIdentifier);
+    return task?.id;
   }
 
   /**
@@ -261,6 +310,7 @@ export class AiAgentService {
       taskId,
       evalContext,
       maxSteps,
+      disableLocalSystem,
       initialStepCount,
       signal,
       userInterventionConfig = { approvalMode: 'headless' },
@@ -280,6 +330,8 @@ export class AiAgentService {
     const identifier = agentId || slug!;
 
     log('execAgent: identifier=%s, prompt=%s', identifier, prompt.slice(0, 50));
+
+    const operationTaskId = await this.resolveOperationTaskId(taskId ?? appContext?.taskId);
 
     const assistantMessageRef: { current?: string } = {};
     const updateAbortedAssistantMessage = async (errorMessage: string) => {
@@ -383,6 +435,25 @@ export class AiAgentService {
         enableHistoryCount: false,
       };
       log('execAgent: injected page-agent runtime for page scope');
+    }
+
+    if (appContext?.scope === 'task' && agentSlug !== BUILTIN_AGENT_SLUGS.taskAgent) {
+      const taskAgentRuntime = getAgentRuntimeConfig(BUILTIN_AGENT_SLUGS.taskAgent, {
+        model: agentConfig.model,
+        plugins: agentConfig.plugins ?? [],
+      });
+      const taskAgentSystemRole = taskAgentRuntime?.systemRole || '';
+
+      if (taskAgentSystemRole) {
+        agentConfig.systemRole = agentConfig.systemRole
+          ? `${agentConfig.systemRole}\n\n${taskAgentSystemRole}`
+          : taskAgentSystemRole;
+      }
+
+      agentConfig.plugins = agentConfig.plugins?.includes(TaskIdentifier)
+        ? agentConfig.plugins
+        : [TaskIdentifier, ...(agentConfig.plugins ?? [])];
+      log('execAgent: injected task-agent runtime for task scope');
     }
 
     await throwIfExecutionAborted('agent configuration');
@@ -517,12 +588,12 @@ export class AiAgentService {
 
       // Prepare metadata with cronJobId, taskId, botContext, and bound device if provided
       const metadata =
-        cronJobId || taskId || botContext || requestedDeviceId
+        cronJobId || operationTaskId || botContext || requestedDeviceId
           ? {
               bot: botContext,
               boundDeviceId: requestedDeviceId,
               cronJobId: cronJobId || undefined,
-              taskId: taskId || undefined,
+              taskId: operationTaskId,
             }
           : undefined;
 
@@ -595,6 +666,40 @@ export class AiAgentService {
 
     // model-bank is needed both for tool support check and model metadata
     const { LOBE_DEFAULT_MODEL_LIST } = await import('model-bank');
+    // Resolve S3 keys in imageList/videoList before visual tool activation checks and context build.
+    const fileService = new FileService(this.db, this.userId);
+    const postProcessUrl = (path: string | null) => fileService.getFullFileUrl(path);
+    let historyMessagesCache: any[] | undefined;
+    const loadHistoryMessages = async () => {
+      if (historyMessagesCache) return historyMessagesCache;
+
+      if (existingMessageIds.length > 0) {
+        const messages = await this.messageModel.query(
+          {
+            sessionId: appContext?.sessionId,
+            threadId: appContext?.threadId,
+            topicId: appContext?.topicId ?? undefined,
+          },
+          { postProcessUrl },
+        );
+        const idSet = new Set(existingMessageIds);
+        historyMessagesCache = messages.filter((msg) => idSet.has(msg.id));
+      } else if (appContext?.topicId) {
+        // Follow-up message in existing topic: load all history for context.
+        historyMessagesCache = await this.messageModel.query(
+          {
+            sessionId: appContext?.sessionId,
+            threadId: appContext?.threadId,
+            topicId: appContext?.topicId,
+          },
+          { postProcessUrl },
+        );
+      } else {
+        historyMessagesCache = [];
+      }
+
+      return historyMessagesCache;
+    };
 
     if (params.disableTools) {
       log('execAgent: tools disabled by disableTools flag, skipping all tool discovery');
@@ -661,12 +766,44 @@ export class AiAgentService {
         isModelSupportToolUse,
       };
 
-      // Dynamically inject topic-reference tool when prompt contains <refer_topic> tags
+      // Dynamically inject turn-scoped builtin tools.
       const hasTopicReference = /refer_topic/.test(prompt ?? '');
+      const modelAbilities =
+        LOBE_DEFAULT_MODEL_LIST.find((item) => item.id === model && item.providerId === provider)
+          ?.abilities ?? LOBE_DEFAULT_MODEL_LIST.find((item) => item.id === model)?.abilities;
+      const externalFileTypes = files?.map((file) => file.mimeType ?? '') ?? [];
+      let attachedFileTypes: string[] = [];
+      if (attachedFileIds && attachedFileIds.length > 0) {
+        const fileModel = new FileModel(this.db, this.userId);
+        const fileRecords = await fileModel.findByIds(Array.from(new Set(attachedFileIds)));
+        attachedFileTypes = fileRecords.map((file) => file.fileType || '');
+      }
+      const inputFileTypes = [...externalFileTypes, ...attachedFileTypes];
+      const inputVisualAvailability = getVisualAvailabilityFromFileTypes(inputFileTypes);
+      let historyVisualAvailability = { hasImages: false, hasVideos: false };
+      const visualUnderstandingConfigured = isVisualUnderstandingConfigured();
+
+      if (
+        visualUnderstandingConfigured &&
+        ((!modelAbilities?.vision && !inputVisualAvailability.hasImages) ||
+          (!modelAbilities?.video && !inputVisualAvailability.hasVideos))
+      ) {
+        historyVisualAvailability = getVisualAvailabilityFromMessages(await loadHistoryMessages());
+      }
+
+      const needsImageUnderstanding =
+        (inputVisualAvailability.hasImages || historyVisualAvailability.hasImages) &&
+        !modelAbilities?.vision;
+      const needsVideoUnderstanding =
+        (inputVisualAvailability.hasVideos || historyVisualAvailability.hasVideos) &&
+        !modelAbilities?.video;
+      const shouldEnableVisualUnderstanding =
+        visualUnderstandingConfigured && (needsImageUnderstanding || needsVideoUnderstanding);
       agentPlugins = [
         ...agentPlugins,
         ...(hasTopicReference ? ['lobe-topic-reference'] : []),
         ...(isBotConversation ? [MessageToolIdentifier] : []),
+        ...(shouldEnableVisualUnderstanding ? [LobeAgentManifest.identifier] : []),
       ];
 
       // Derive activeDeviceId from device context:
@@ -697,6 +834,7 @@ export class AiAgentService {
               gatewayConfigured: true,
             }
           : undefined,
+        disableLocalSystem,
         globalMemoryEnabled,
         hasAgentDocuments,
         hasEnabledKnowledgeBases,
@@ -707,14 +845,14 @@ export class AiAgentService {
 
       // 5f. Generate tools and manifest map
       const pluginIds = [
-        ...(agentConfig.plugins || []),
-        ...(additionalPluginIds || []),
-        LocalSystemManifest.identifier,
-        RemoteDeviceManifest.identifier,
-        ...(isBotConversation ? [MessageToolIdentifier] : []),
-        // Include LobeHub Skills and Klavis tools so they are passed to generateToolsDetailed
-        ...lobehubSkillManifests.map((m) => m.identifier),
-        ...klavisManifests.map((m) => m.identifier),
+        ...new Set([
+          ...agentPlugins,
+          ...(disableLocalSystem ? [] : [LocalSystemManifest.identifier]),
+          RemoteDeviceManifest.identifier,
+          // Include LobeHub Skills and Klavis tools so they are passed to generateToolsDetailed
+          ...lobehubSkillManifests.map((m) => m.identifier),
+          ...klavisManifests.map((m) => m.identifier),
+        ]),
       ];
       log('execAgent: agent configured plugins: %O', pluginIds);
 
@@ -742,6 +880,10 @@ export class AiAgentService {
       // (e.g., lobe-creds, lobe-cron). Exclude discoverable:false tools to prevent
       // internal infrastructure tools from being surfaced to the activator.
       for (const tool of builtinTools) {
+        if (disableLocalSystem && tool.identifier === LocalSystemManifest.identifier) {
+          continue;
+        }
+
         if (tool.discoverable !== false && !toolManifestMap[tool.identifier]) {
           toolManifestMap[tool.identifier] = tool.manifest as LobeToolManifest;
         }
@@ -1048,35 +1190,8 @@ export class AiAgentService {
       }
     }
 
-    // 11. Get existing messages if provided
-    // Use postProcessUrl to resolve S3 keys in imageList to publicly accessible URLs,
-    // matching the frontend flow in aiChatService.getMessagesAndTopics.
-    const fileService = new FileService(this.db, this.userId);
-    const postProcessUrl = (path: string | null) => fileService.getFullFileUrl(path);
-
-    let historyMessages: any[] = [];
-    if (existingMessageIds.length > 0) {
-      historyMessages = await this.messageModel.query(
-        {
-          sessionId: appContext?.sessionId,
-          threadId: appContext?.threadId,
-          topicId: appContext?.topicId ?? undefined,
-        },
-        { postProcessUrl },
-      );
-      const idSet = new Set(existingMessageIds);
-      historyMessages = historyMessages.filter((msg) => idSet.has(msg.id));
-    } else if (appContext?.topicId) {
-      // Follow-up message in existing topic: load all history for context
-      historyMessages = await this.messageModel.query(
-        {
-          sessionId: appContext?.sessionId,
-          threadId: appContext?.threadId,
-          topicId: appContext?.topicId,
-        },
-        { postProcessUrl },
-      );
-    }
+    // 11. Get existing messages if provided.
+    const historyMessages = await loadHistoryMessages();
 
     await throwIfExecutionAborted('message history loading');
 
@@ -1406,6 +1521,20 @@ export class AiAgentService {
       }
     }
 
+    if (appContext?.scope === 'task' && appContext.defaultTaskAssigneeAgentId) {
+      initialContext = {
+        ...initialContext,
+        initialContext: {
+          ...initialContext.initialContext,
+          taskManager: {
+            contextPrompt: buildTaskManagerDefaultsPrompt({
+              defaultAssigneeAgentId: appContext.defaultTaskAssigneeAgentId,
+            }),
+          },
+        },
+      };
+    }
+
     // 16b. Human-approval resume — override initialContext based on the
     // user's decision. The DB write above has already persisted the
     // intervention status, so `allMessages` reflects the decision for the
@@ -1520,10 +1649,12 @@ export class AiAgentService {
         userTimezone,
         appContext: {
           agentId: resolvedAgentId,
+          defaultTaskAssigneeAgentId: appContext?.defaultTaskAssigneeAgentId,
           documentId: appContext?.documentId,
           groupId: appContext?.groupId,
           scope: appContext?.scope,
-          taskId,
+          sourceMessageId: userMessageRecord?.id ?? parentMessageId ?? undefined,
+          taskId: operationTaskId,
           threadId: appContext?.threadId,
           topicId,
           trigger,
