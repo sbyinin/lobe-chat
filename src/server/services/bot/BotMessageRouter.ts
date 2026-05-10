@@ -7,6 +7,7 @@ import { getServerDB } from '@/database/core/db-adaptor';
 import type { DecryptedBotProvider } from '@/database/models/agentBotProvider';
 import { AgentBotProviderModel } from '@/database/models/agentBotProvider';
 import type { LobeChatDatabase } from '@/database/type';
+import { appEnv } from '@/envs/app';
 import { getAgentRuntimeRedisClient } from '@/server/modules/AgentRuntime/redis';
 import { KeyVaultsGateKeeper } from '@/server/modules/KeyVaultsEncrypt';
 import { emitAgentSignalSourceEvent } from '@/server/services/agentSignal';
@@ -296,7 +297,7 @@ export class BotMessageRouter {
     );
 
     const runtimeContext: BotPlatformRuntimeContext = {
-      appUrl: process.env.APP_URL,
+      appUrl: appEnv.APP_URL,
       redisClient: getAgentRuntimeRedisClient() as any,
     };
 
@@ -477,7 +478,7 @@ export class BotMessageRouter {
     const { agentId, applicationId, platform, userId } = info;
     const bridge = new AgentBridgeService(serverDB, userId);
     const charLimit = (info.settings?.charLimit as number) || undefined;
-    const displayToolCalls = info.settings?.displayToolCalls !== false;
+    const displayToolCalls = info.settings?.displayToolCalls === true;
     const dmSettings: DmSettings = extractDmSettings(info.settings);
     const groupSettings: GroupSettings = extractGroupSettings(info.settings);
     const userAllowlist: UserAllowlist = extractUserAllowlist(info.settings);
@@ -871,19 +872,32 @@ export class BotMessageRouter {
         (context?.skipped?.length ?? 0) + 1,
         ((merged as any).attachments as unknown[] | undefined)?.length ?? 0,
       );
+      const senderExternalUserId = merged.author?.userId ?? '';
+      const isOwner = !!operatorUserId && senderExternalUserId === operatorUserId;
       try {
         await bridge.handleMention(thread, merged, {
           agentId,
-          botContext: { applicationId, platform, platformThreadId: thread.id },
+          botContext: {
+            applicationId,
+            isOwner,
+            platform,
+            platformThreadId: thread.id,
+            senderExternalUserId,
+          },
           charLimit,
           client,
           displayToolCalls,
           replyLocale,
         });
       } catch (error) {
-        log('onNewMention: unhandled error from handleMention: %O', error);
+        const operationId = AgentBridgeService.getActiveOperationId(thread.id);
+        log(
+          'onNewMention: unhandled error from handleMention: operationId=%s, %O',
+          operationId,
+          error,
+        );
         try {
-          await thread.post(renderError(undefined, replyLocale));
+          await thread.post({ markdown: renderError(operationId, replyLocale) });
         } catch {
           // best-effort notification
         }
@@ -980,19 +994,32 @@ export class BotMessageRouter {
         ((merged as any).attachments as unknown[] | undefined)?.length ?? 0,
       );
 
+      const senderExternalUserId = merged.author?.userId ?? '';
+      const isOwner = !!operatorUserId && senderExternalUserId === operatorUserId;
       try {
         await bridge.handleSubscribedMessage(thread, merged, {
           agentId,
-          botContext: { applicationId, platform, platformThreadId: thread.id },
+          botContext: {
+            applicationId,
+            isOwner,
+            platform,
+            platformThreadId: thread.id,
+            senderExternalUserId,
+          },
           charLimit,
           client,
           displayToolCalls,
           replyLocale,
         });
       } catch (error) {
-        log('onSubscribedMessage: unhandled error from handleSubscribedMessage: %O', error);
+        const operationId = AgentBridgeService.getActiveOperationId(thread.id);
+        log(
+          'onSubscribedMessage: unhandled error from handleSubscribedMessage: operationId=%s, %O',
+          operationId,
+          error,
+        );
         try {
-          await thread.post(renderError(undefined, replyLocale));
+          await thread.post({ markdown: renderError(operationId, replyLocale) });
         } catch {
           // best-effort notification
         }
@@ -1098,10 +1125,18 @@ export class BotMessageRouter {
           ((merged as any).attachments as unknown[] | undefined)?.length ?? 0,
         );
 
+        const senderExternalUserId = merged.author?.userId ?? '';
+        const isOwner = !!operatorUserId && senderExternalUserId === operatorUserId;
         try {
           await bridge.handleMention(thread, merged, {
             agentId,
-            botContext: { applicationId, platform, platformThreadId: thread.id },
+            botContext: {
+              applicationId,
+              isOwner,
+              platform,
+              platformThreadId: thread.id,
+              senderExternalUserId,
+            },
             charLimit,
             client,
             displayToolCalls,
@@ -1111,7 +1146,7 @@ export class BotMessageRouter {
           log('onNewMessage: unhandled error from handleMention: %O', error);
           try {
             const errMsg = error instanceof Error ? error.message : String(error);
-            await thread.post(renderInlineError(errMsg, replyLocale));
+            await thread.post({ markdown: renderInlineError(errMsg, replyLocale) });
           } catch {
             // best-effort notification
           }

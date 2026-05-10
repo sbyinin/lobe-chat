@@ -4,6 +4,8 @@ import { spawn } from 'node:child_process';
 import type { AgentStreamEvent } from '@lobechat/agent-gateway-client';
 
 import { AgentStreamPipeline } from './agentStreamPipeline';
+import type { AgentPromptInput, BuildAgentInputOptions } from './input';
+import { buildAgentInput } from './input';
 
 export interface SpawnAgentOptions {
   /** Agent type key (`'claude-code'` | `'codex'`). */
@@ -21,14 +23,31 @@ export interface SpawnAgentOptions {
   /** Extra CLI arguments appended after the agent's preset flags. */
   extraArgs?: string[];
   /**
+   * (Claude Code only) Pass `--include-partial-messages` so the CLI streams
+   * delta chunks instead of only complete blocks. Off by default — terminal
+   * runs and bulk-ingest flows usually want fewer events. Turn on when a
+   * connected client renders live token streaming.
+   */
+  includePartialMessages?: boolean;
+  /**
+   * Image normalization options (URL fetch + on-disk cache + path
+   * materialization). Forwarded to `buildAgentInput`. When `prompt` is a
+   * plain string this is unused.
+   */
+  inputOptions?: BuildAgentInputOptions;
+  /**
    * Operation id stamped onto every emitted `AgentStreamEvent`. For ingest-
    * connected runs this is the server-allocated op id; for standalone runs
    * (no `--topic` / `--operation-id`) the CLI generates a fresh uuid so
    * events still carry the conventional shape.
    */
   operationId: string;
-  /** User prompt text. Always passed via stdin (CC: stream-json; Codex: raw). */
-  prompt: string;
+  /**
+   * User prompt. A plain string is sugar for a single text block; the array
+   * form supports mixed text + image content blocks (URL / path / base64).
+   * Translated to per-agent stdin + CLI flags via `buildAgentInput`.
+   */
+  prompt: AgentPromptInput;
   /** Resume an existing agent session by its native session id (CC) / thread id (Codex). */
   resumeSessionId?: string;
 }
@@ -57,65 +76,103 @@ export interface SpawnAgentHandle {
   /** Spawned child PID, undefined if spawn failed pre-PID. */
   pid: number | undefined;
   /**
+   * The agent's native session id, extracted from the `system:init` event.
+   * Available after the `events` async iterable has been fully consumed.
+   * Used by `lh hetero exec` to pass `sessionId` to `heteroFinish` so the
+   * server can persist it for `--resume` on the next turn.
+   */
+  readonly sessionId: string | undefined;
+  /**
    * The child's stderr stream — caller can pipe to its own stderr or
    * collect for error reporting. The pipeline does not consume stderr.
    */
   stderr: NodeJS.ReadableStream;
 }
 
-const CLAUDE_CODE_BASE_ARGS = [
+/**
+ * Invariant Claude Code CLI flags shared by every spawn site (desktop driver,
+ * `lh hetero exec`). Permission mode and `--include-partial-messages` vary by
+ * caller — the desktop UI wants live deltas + user-mode bypassPermissions, the
+ * sandbox CLI may run as root and skip partials — so they're composed on top
+ * of this base.
+ *
+ * `AskUserQuestion` is disabled because CC's CLI self-injects an
+ * `is_error: "Answer questions?"` tool_result in `-p` mode before the host
+ * can surface the questions, so the model falls back to plain-text prompting
+ * anyway. Remove this once a local MCP-backed replacement is wired to
+ * LobeHub's intervention UI.
+ */
+export const CLAUDE_CODE_BASE_ARGS = [
   '-p',
   '--input-format',
   'stream-json',
   '--output-format',
   'stream-json',
   '--verbose',
-  '--include-partial-messages',
-  '--permission-mode',
-  'bypassPermissions',
+  '--disallowedTools',
+  'AskUserQuestion',
 ] as const;
+
+// bypassPermissions is blocked when running as root (e.g. cloud sandbox).
+// Fall back to acceptEdits + pre-approved tools so the agent can still run
+// headlessly without interactive permission prompts.
+const isRunningAsRoot = () => process.getuid?.() === 0;
+
+const CLAUDE_CODE_PERMISSION_ARGS = (): string[] =>
+  isRunningAsRoot()
+    ? [
+        '--permission-mode',
+        'acceptEdits',
+        '--allowed-tools',
+        'Bash,Read,Write,Edit,MultiEdit,WebSearch,mcp__*',
+      ]
+    : ['--permission-mode', 'bypassPermissions'];
 
 const CODEX_REQUIRED_ARGS = ['--json', '--skip-git-repo-check', '--full-auto'] as const;
 
-const buildClaudeCodeArgs = (resumeSessionId: string | undefined, extraArgs: string[]) => [
+interface BuildSpawnArgsParams {
+  agentType: string;
+  /** Extra CLI arguments appended after the agent's preset flags. */
+  extraArgs: string[];
+  /** (Claude Code only) Stream `--include-partial-messages` deltas. */
+  includePartialMessages: boolean;
+  /** Per-agent input args produced by `buildAgentInput` (e.g. Codex `--image`). */
+  inputArgs: string[];
+  /** Native session id for resume; undefined for fresh runs. */
+  resumeSessionId: string | undefined;
+}
+
+const buildClaudeCodeArgs = ({
+  extraArgs,
+  includePartialMessages,
+  inputArgs,
+  resumeSessionId,
+}: BuildSpawnArgsParams) => [
   ...CLAUDE_CODE_BASE_ARGS,
+  ...(includePartialMessages ? ['--include-partial-messages'] : []),
+  ...CLAUDE_CODE_PERMISSION_ARGS(),
   ...(resumeSessionId ? ['--resume', resumeSessionId] : []),
+  ...inputArgs,
   ...extraArgs,
 ];
 
-const buildCodexArgs = (resumeSessionId: string | undefined, extraArgs: string[]) =>
+const buildCodexArgs = ({ extraArgs, inputArgs, resumeSessionId }: BuildSpawnArgsParams) =>
   resumeSessionId
-    ? ['exec', 'resume', ...CODEX_REQUIRED_ARGS, ...extraArgs, resumeSessionId, '-']
-    : ['exec', ...CODEX_REQUIRED_ARGS, ...extraArgs];
+    ? ['exec', 'resume', ...CODEX_REQUIRED_ARGS, ...inputArgs, ...extraArgs, resumeSessionId, '-']
+    : ['exec', ...CODEX_REQUIRED_ARGS, ...inputArgs, ...extraArgs];
 
-const buildSpawnArgs = (
-  agentType: string,
-  resumeSessionId: string | undefined,
-  extraArgs: string[],
-): string[] => {
-  switch (agentType) {
+const buildSpawnArgs = (params: BuildSpawnArgsParams): string[] => {
+  switch (params.agentType) {
     case 'claude-code': {
-      return buildClaudeCodeArgs(resumeSessionId, extraArgs);
+      return buildClaudeCodeArgs(params);
     }
     case 'codex': {
-      return buildCodexArgs(resumeSessionId, extraArgs);
+      return buildCodexArgs(params);
     }
     default: {
-      throw new Error(`spawnAgent: unsupported agent type "${agentType}"`);
+      throw new Error(`spawnAgent: unsupported agent type "${params.agentType}"`);
     }
   }
-};
-
-const buildStdinPayload = (agentType: string, prompt: string): string => {
-  if (agentType === 'claude-code') {
-    return `${JSON.stringify({
-      message: { content: [{ text: prompt, type: 'text' }], role: 'user' },
-      type: 'user',
-    })}\n`;
-  }
-  // Codex reads the prompt as plain text from stdin (the `-` positional in
-  // resume mode also reads from stdin).
-  return prompt;
 };
 
 const defaultCommand = (agentType: string): string => (agentType === 'codex' ? 'codex' : 'claude');
@@ -152,17 +209,25 @@ const killProcessTree = (proc: ChildProcess, signal: NodeJS.Signals): void => {
  * unified `AgentStreamEvent`s. Used by `lh hetero exec` for both standalone
  * terminal runs and (later) sandbox-driven runs that ingest into the server.
  *
- * Stays minimal on purpose — no image attachment, no on-disk tracing, no
- * proxy env composition, no CLI-not-found classification. Those host
- * concerns live in the desktop main controller, which does NOT use this
- * function (it instantiates `AgentStreamPipeline` directly with its own
- * spawn logic). The CLI sandbox is a smaller environment where the minimal
- * surface is correct.
+ * Stays minimal on purpose — no on-disk tracing, no proxy env composition,
+ * no CLI-not-found classification. Those host concerns live in the desktop
+ * main controller, which has its own spawn logic on top. The CLI sandbox is
+ * a smaller environment where the minimal surface is correct.
+ *
+ * Returns a Promise because image normalization (URL fetch / file read) is
+ * async; the spawn itself happens after the input plan is resolved so a
+ * failed image fetch surfaces before the child starts.
  */
-export const spawnAgent = (options: SpawnAgentOptions): SpawnAgentHandle => {
+export const spawnAgent = async (options: SpawnAgentOptions): Promise<SpawnAgentHandle> => {
   const command = options.command || defaultCommand(options.agentType);
-  const args = buildSpawnArgs(options.agentType, options.resumeSessionId, options.extraArgs ?? []);
-  const stdinPayload = buildStdinPayload(options.agentType, options.prompt);
+  const inputPlan = await buildAgentInput(options.agentType, options.prompt, options.inputOptions);
+  const args = buildSpawnArgs({
+    agentType: options.agentType,
+    extraArgs: options.extraArgs ?? [],
+    includePartialMessages: options.includePartialMessages ?? false,
+    inputArgs: inputPlan.args,
+    resumeSessionId: options.resumeSessionId,
+  });
   const cwd = options.cwd || process.cwd();
 
   const proc = spawn(command, args, {
@@ -173,7 +238,7 @@ export const spawnAgent = (options: SpawnAgentOptions): SpawnAgentHandle => {
   });
 
   if (proc.stdin) {
-    proc.stdin.write(stdinPayload, () => {
+    proc.stdin.write(inputPlan.stdin, () => {
       proc.stdin?.end();
     });
   }
@@ -285,6 +350,9 @@ export const spawnAgent = (options: SpawnAgentOptions): SpawnAgentHandle => {
     exit,
     kill: (signal: NodeJS.Signals = 'SIGINT') => killProcessTree(proc, signal),
     pid: proc.pid,
+    get sessionId() {
+      return pipeline.sessionId;
+    },
     stderr,
   };
 };

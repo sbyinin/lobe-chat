@@ -89,7 +89,7 @@ describe('spawnAgent', () => {
     nextFakeProc = fake.proc;
 
     const { spawnAgent } = await import('./spawnAgent');
-    const handle = spawnAgent({
+    const handle = await spawnAgent({
       agentType: 'claude-code',
       operationId: 'op-1',
       prompt: 'do a thing',
@@ -107,7 +107,14 @@ describe('spawnAgent', () => {
     expect(call.args).toContain('--output-format');
     expect(call.args.filter((a) => a === 'stream-json')).toHaveLength(2);
     expect(call.args).toContain('-p');
-    expect(call.args).toContain('--include-partial-messages');
+    // CC's built-in interactive Q&A is disabled at every spawn site so the
+    // model degrades to plain-text questioning instead of stalling on a
+    // synthetic "Answer questions?" tool_result.
+    const disallowedIdx = call.args.indexOf('--disallowedTools');
+    expect(disallowedIdx).toBeGreaterThan(-1);
+    expect(call.args[disallowedIdx + 1]).toBe('AskUserQuestion');
+    // Partial deltas are opt-in — terminal/sandbox callers want fewer events.
+    expect(call.args).not.toContain('--include-partial-messages');
     // Prompt MUST go through stdin as a stream-json user message — never as argv.
     expect(call.args).not.toContain('do a thing');
     expect(fake.stdinWrites).toHaveLength(1);
@@ -121,10 +128,22 @@ describe('spawnAgent', () => {
     for (const event of events) expect(event.operationId).toBe('op-1');
   });
 
+  it('passes --include-partial-messages only when includePartialMessages=true', async () => {
+    nextFakeProc = createFakeProc().proc;
+    const { spawnAgent } = await import('./spawnAgent');
+    await spawnAgent({
+      agentType: 'claude-code',
+      includePartialMessages: true,
+      operationId: 'op-1',
+      prompt: 'do a thing',
+    });
+    expect(spawnCalls[0].args).toContain('--include-partial-messages');
+  });
+
   it('appends --resume <id> for claude when resuming a session', async () => {
     nextFakeProc = createFakeProc().proc;
     const { spawnAgent } = await import('./spawnAgent');
-    spawnAgent({
+    await spawnAgent({
       agentType: 'claude-code',
       operationId: 'op-1',
       prompt: 'continue',
@@ -140,7 +159,7 @@ describe('spawnAgent', () => {
   it('builds codex args with `exec` + json + skip-git-repo-check + full-auto', async () => {
     nextFakeProc = createFakeProc().proc;
     const { spawnAgent } = await import('./spawnAgent');
-    spawnAgent({ agentType: 'codex', operationId: 'op-1', prompt: 'hello' });
+    await spawnAgent({ agentType: 'codex', operationId: 'op-1', prompt: 'hello' });
 
     const { args, command } = spawnCalls[0];
     expect(command).toBe('codex');
@@ -153,7 +172,7 @@ describe('spawnAgent', () => {
   it('uses codex `exec resume` form with thread id + `-` stdin marker on resume', async () => {
     nextFakeProc = createFakeProc().proc;
     const { spawnAgent } = await import('./spawnAgent');
-    spawnAgent({
+    await spawnAgent({
       agentType: 'codex',
       operationId: 'op-1',
       prompt: 'continue',
@@ -166,10 +185,74 @@ describe('spawnAgent', () => {
     expect(args.at(-1)).toBe('-');
   });
 
+  it('serializes multimodal content blocks into the CC stream-json user message', async () => {
+    nextFakeProc = createFakeProc().proc;
+    const { spawnAgent } = await import('./spawnAgent');
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
+    await spawnAgent({
+      agentType: 'claude-code',
+      operationId: 'op-1',
+      prompt: [
+        { text: 'describe this', type: 'text' },
+        {
+          source: { data: pngBytes.toString('base64'), mediaType: 'image/png', type: 'base64' },
+          type: 'image',
+        },
+      ],
+    });
+
+    // The mock's fake stdin captures everything written.
+    const stdinPayload = (nextFakeProc as any).stdin.write.mock.calls[0][0] as string;
+    const userMsg = JSON.parse(stdinPayload.trim());
+    expect(userMsg.message.content).toEqual([
+      { text: 'describe this', type: 'text' },
+      {
+        source: {
+          data: pngBytes.toString('base64'),
+          media_type: 'image/png',
+          type: 'base64',
+        },
+        type: 'image',
+      },
+    ]);
+  });
+
+  it('renders codex multimodal input as text-on-stdin + repeatable --image flags', async () => {
+    nextFakeProc = createFakeProc().proc;
+    const os = await import('node:os');
+    const fsp = await import('node:fs/promises');
+    const cacheDir = await fsp.mkdtemp(`${os.tmpdir()}/spawn-agent-codex-`);
+
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
+    const { spawnAgent } = await import('./spawnAgent');
+    await spawnAgent({
+      agentType: 'codex',
+      inputOptions: { cacheDir },
+      operationId: 'op-1',
+      prompt: [
+        { text: 'look', type: 'text' },
+        {
+          source: { data: pngBytes.toString('base64'), mediaType: 'image/png', type: 'base64' },
+          type: 'image',
+        },
+      ],
+    });
+
+    const { args } = spawnCalls[0];
+    const imageIdx = args.indexOf('--image');
+    expect(imageIdx).toBeGreaterThan(-1);
+    const materializedPath = args[imageIdx + 1]!;
+    expect(materializedPath.startsWith(cacheDir)).toBe(true);
+    expect(materializedPath.endsWith('.png')).toBe(true);
+    // Codex receives the prompt text on stdin.
+    const stdinPayload = (nextFakeProc as any).stdin.write.mock.calls[0][0] as string;
+    expect(stdinPayload).toBe('look');
+  });
+
   it('honors a custom --command override + extraArgs', async () => {
     nextFakeProc = createFakeProc().proc;
     const { spawnAgent } = await import('./spawnAgent');
-    spawnAgent({
+    await spawnAgent({
       agentType: 'claude-code',
       command: '/usr/local/bin/claude-wrapped',
       extraArgs: ['--my-flag', 'x'],
@@ -183,12 +266,12 @@ describe('spawnAgent', () => {
     expect(args).toContain('x');
   });
 
-  it('throws on unknown agent type', async () => {
+  it('rejects with an error on unknown agent type', async () => {
     nextFakeProc = createFakeProc().proc;
     const { spawnAgent } = await import('./spawnAgent');
-    expect(() =>
+    await expect(
       spawnAgent({ agentType: 'kimi-cli', operationId: 'op-1', prompt: 'hi' }),
-    ).toThrowError(/unsupported agent type/);
+    ).rejects.toThrow(/unsupported agent type/);
   });
 
   it('events iterator drains all pipeline events including the trailing flush', async () => {
@@ -196,7 +279,7 @@ describe('spawnAgent', () => {
     nextFakeProc = fake.proc;
 
     const { spawnAgent } = await import('./spawnAgent');
-    const handle = spawnAgent({
+    const handle = await spawnAgent({
       agentType: 'claude-code',
       operationId: 'op-7',
       prompt: 'go',
@@ -257,7 +340,11 @@ describe('spawnAgent', () => {
     const fake = createFakeProc();
     nextFakeProc = fake.proc;
     const { spawnAgent } = await import('./spawnAgent');
-    const handle = spawnAgent({ agentType: 'claude-code', operationId: 'op-1', prompt: 'go' });
+    const handle = await spawnAgent({
+      agentType: 'claude-code',
+      operationId: 'op-1',
+      prompt: 'go',
+    });
 
     // Fire two chunks back-to-back BEFORE 'end'. Both `pipeline.push()` calls
     // are now in flight; without serialization, B's events would queue first.
@@ -309,7 +396,11 @@ describe('spawnAgent', () => {
     const fake = createFakeProc();
     nextFakeProc = fake.proc;
     const { spawnAgent } = await import('./spawnAgent');
-    const handle = spawnAgent({ agentType: 'claude-code', operationId: 'op-1', prompt: 'go' });
+    const handle = await spawnAgent({
+      agentType: 'claude-code',
+      operationId: 'op-1',
+      prompt: 'go',
+    });
 
     // 'end' fires immediately after the chunk write — pipeline.push() is still
     // pending. The fix must keep the iterator open until that push resolves.
@@ -330,7 +421,7 @@ describe('spawnAgent', () => {
     nextFakeProc = fake.proc;
 
     const { spawnAgent } = await import('./spawnAgent');
-    const handle = spawnAgent({
+    const handle = await spawnAgent({
       agentType: 'claude-code',
       operationId: 'op-1',
       prompt: 'go',

@@ -14,7 +14,26 @@
  */
 export { AgentStreamPipeline, type AgentStreamPipelineOptions } from './agentStreamPipeline';
 export { CodexFileChangeTracker } from './codexFileChangeTracker';
+export {
+  type AgentContentBlock,
+  type AgentImageBlock,
+  type AgentImageSource,
+  type AgentInputPlan,
+  type AgentPromptInput,
+  type AgentTextBlock,
+  buildAgentInput,
+  type BuildAgentInputOptions,
+  materializeImageToPath,
+  type NormalizedImage,
+  normalizeImage,
+  type NormalizeImageOptions,
+} from './input';
 export { JsonlStreamProcessor } from './jsonlProcessor';
-export { spawnAgent, type SpawnAgentHandle, type SpawnAgentOptions } from './spawnAgent';
+export {
+  CLAUDE_CODE_BASE_ARGS,
+  spawnAgent,
+  type SpawnAgentHandle,
+  type SpawnAgentOptions,
+} from './spawnAgent';
 export { toStreamEvent } from './streamEvent';
 export type { AgentStreamEvent, AgentStreamEventType } from '@lobechat/agent-gateway-client';
