@@ -14,6 +14,7 @@ import type { SubagentEventContext, ToolCallPayload } from '@lobechat/heterogene
 import type {
   ChatMessageError,
   ChatToolPayload,
+  ChatTopicStatus,
   ConversationContext,
   HeterogeneousProviderConfig,
   MessageMapScope,
@@ -1054,6 +1055,7 @@ export const executeHeterogeneousAgent = async (
     messageError: ChatMessageError,
     options?: { clearContent?: boolean },
   ) => {
+    writeTopicStatus('failed');
     get().internal_toggleToolCallingStreaming(currentAssistantMessageId, undefined);
     get().completeOperation(operationId);
 
@@ -1175,6 +1177,10 @@ export const executeHeterogeneousAgent = async (
       workingDirectory: workingDirectory ?? '',
     });
   };
+  const writeTopicStatus = (status: ChatTopicStatus): void => {
+    if (!context.topicId) return;
+    void get().updateTopicStatus?.(context.topicId, status);
+  };
   const retryWithoutResume = (error: unknown): boolean => {
     if (
       resumeFallbackTriggered ||
@@ -1294,6 +1300,8 @@ export const executeHeterogeneousAgent = async (
     });
     agentSessionId = result.sessionId;
     if (!agentSessionId) throw new Error('Agent session returned no sessionId');
+
+    writeTopicStatus('running');
 
     // Register cancel hook on the operation — when the user hits Stop, the op
     // framework calls this; we SIGINT the CC process via the main-process IPC
@@ -1696,9 +1704,25 @@ export const executeHeterogeneousAgent = async (
       }
 
       // Forward to the unified Gateway handler.
-      // If a step transition is pending, defer through persistQueue so the
-      // handler receives stream_start (with new assistant ID) FIRST.
-      if (pendingStepTransition) {
+      //
+      // Events that drive `fetchAndReplaceMessages` on the handler side
+      // (`tool_end`, `step_complete:execution_complete`, `stream_chunk` with a
+      // server-attached `toolMessageIds`) must wait for `persistQueue` to drain
+      // — otherwise the handler reads `assistant.tools[]` while a parallel
+      // `persistToolBatch` is still mid-flight and `replaceMessages` clobbers
+      // the in-memory cumulative tools[] with a shorter snapshot. That's the
+      // "7 → 6 次技能调用" rollback users see on parallel CC tool batches.
+      //
+      // Other forwards (text / reasoning / tools_calling dispatches) stay
+      // synchronous so live streaming UX isn't gated on DB round-trips.
+      const triggersFetchAndReplace =
+        event.type === 'tool_end' ||
+        (event.type === 'step_complete' &&
+          (event.data as { phase?: string } | undefined)?.phase === 'execution_complete') ||
+        (event.type === 'stream_chunk' &&
+          (event.data as { toolMessageIds?: unknown } | undefined)?.toolMessageIds !== undefined);
+
+      if (pendingStepTransition || triggersFetchAndReplace) {
         persistQueue = persistQueue.then(() => {
           eventHandler(event);
         });
@@ -1762,6 +1786,7 @@ export const executeHeterogeneousAgent = async (
             clearContent: shouldClearTerminalErrorContent,
           });
         } else {
+          writeTopicStatus('active');
           // NOW forward the deferred terminal event — handler will fetchAndReplaceMessages
           // and pick up the final persisted state.
           const terminal: AgentStreamEvent = deferredTerminalEvent ?? {
@@ -1822,7 +1847,10 @@ export const executeHeterogeneousAgent = async (
         // If the error came from a user-initiated cancel (SIGINT → non-zero
         // exit), don't surface it as a runtime error toast — the operation is
         // already marked cancelled and the partial content is persisted above.
-        if (isAborted()) return;
+        if (isAborted()) {
+          writeTopicStatus('active');
+          return;
+        }
 
         await persistTerminalError(messageError, { clearContent: shouldClearTerminalErrorContent });
       },
@@ -1910,7 +1938,10 @@ export const executeHeterogeneousAgent = async (
       completed = true;
       // `sendPrompt` rejects when the CLI exits non-zero, which is how SIGINT
       // lands here too. If the user cancelled, don't surface an error.
-      if (isAborted()) return;
+      if (isAborted()) {
+        writeTopicStatus('active');
+        return;
+      }
       const messageError = toHeterogeneousAgentMessageError(error, adapterType);
       await persistTerminalError(messageError, {
         clearContent: shouldSuppressTerminalErrorEcho(accumulatedContent, messageError),
