@@ -90,6 +90,7 @@ export class LocalSystemExecutionRuntime extends ComputerRuntime {
 
       case 'listLocalFiles': {
         return {
+          limit: params.limit,
           path: params.directoryPath,
           sortBy: params.sortBy,
           sortOrder: params.sortOrder,
@@ -113,7 +114,7 @@ export class LocalSystemExecutionRuntime extends ComputerRuntime {
       }
 
       case 'getCommandOutput': {
-        return { shell_id: params.commandId };
+        return { filter: params.filter, shell_id: params.commandId };
       }
 
       case 'killCommand': {
@@ -184,9 +185,9 @@ export class LocalSystemExecutionRuntime extends ComputerRuntime {
       case 'getCommandOutput': {
         return {
           result: {
+            exitCode: raw.exit_code,
             error: raw.error,
             newOutput: raw.output,
-            running: raw.running,
             success: raw.success,
           },
           success: raw.success,

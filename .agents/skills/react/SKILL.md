@@ -1,6 +1,6 @@
 ---
 name: react
-description: 'Use when writing or editing any `.tsx` under `src/**`. Triggers: createStaticStyles, createStyles, cssVar, antd-style, Flexbox, Center, Select, Modal, Drawer, Button, Tooltip, DropdownMenu, Popover, Switch, ScrollArea, Link, useNavigate, react-router-dom, next/link, desktopRouter, componentMap.desktop, .desktop.tsx, new component, new page, edit layout, add styles, zustand selector, @lobehub/ui, antd import.'
+description: "LobeHub React component conventions — styling via `antd-style` `createStaticStyles` + `cssVar.*` (zero-runtime preferred over `createStyles` + `token`), `@lobehub/ui` over antd when both exist, routing via `react-router-dom` (not `next/link`). Use when writing or editing any `.tsx` under `src/**`. Triggers on `createStaticStyles`, `createStyles`, `cssVar`, `antd-style`, `Flexbox`, `Center`, `Select`, `Modal`, `Drawer`, `Button`, `Tooltip`, `DropdownMenu`, `Popover`, `Switch`, `ScrollArea`, `Link`, `useNavigate`, `react-router-dom`, `next/link`, `desktopRouter`, `componentMap.desktop`, `.desktop.tsx`, 'new component', 'new page', 'edit layout', 'add styles', 'zustand selector', '@lobehub/ui', 'antd import'."
 user-invocable: false
 ---
 
@@ -85,11 +85,12 @@ errorElement: <ErrorBoundary />;
 
 ## Common Mistakes
 
-| Mistake                                  | Fix                                                    |
-| ---------------------------------------- | ------------------------------------------------------ |
-| Using `next/link` in SPA                 | Use `react-router-dom` `Link`                          |
-| Using antd directly                      | Use `@lobehub/ui/base-ui` first, then `@lobehub/ui`    |
-| `createStyles` for static styles         | Use `createStaticStyles` + `cssVar`                    |
-| Editing only `desktopRouter.config.tsx`  | Must edit both `.tsx` and `.desktop.tsx`               |
-| Using `margin` for flex spacing          | Use `gap` prop on Flexbox                              |
-| Accessing zustand store without selector | Use selectors to access store data (see zustand skill) |
+| Mistake                                                           | Fix                                                               |
+| ----------------------------------------------------------------- | ----------------------------------------------------------------- |
+| Using `next/link` in SPA                                          | Use `react-router-dom` `Link`                                     |
+| Using antd directly                                               | Use `@lobehub/ui/base-ui` first, then `@lobehub/ui`               |
+| `createStyles` for static styles                                  | Use `createStaticStyles` + `cssVar`                               |
+| Editing only `desktopRouter.config.tsx`                           | Must edit both `.tsx` and `.desktop.tsx`                          |
+| Using `margin` for flex spacing                                   | Use `gap` prop on Flexbox                                         |
+| Accessing zustand store without selector                          | Use selectors to access store data (see zustand skill)            |
+| Text or icon-text actions built with `Flexbox`/`Text` + `onClick` | Use `Button type={'text'} size={'small'}` with `icon` when needed |

@@ -1,4 +1,5 @@
 import type { AgentStreamEvent } from '@lobechat/agent-gateway-client';
+import { LOADING_FLAT } from '@lobechat/const';
 import {
   AgentRuntimeErrorType,
   type ChatMessageError,
@@ -157,6 +158,8 @@ interface OperationState {
   lastModel: string | undefined;
   lastProvider: string | undefined;
   lastStepIndex: number;
+  lastTextSnapshotSeq: number;
+  messageMetadata: Record<string, any>;
   operationId: string;
   processedKeys: Set<string>;
   subagentRuns: Map<string, SubagentRunState>;
@@ -176,6 +179,13 @@ const operationStates = new Map<string, OperationState>();
 
 /** Test-only reset hook to clear the singleton between specs. */
 export const __resetOperationStatesForTesting = () => operationStates.clear();
+
+export class StaleHeteroOperationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StaleHeteroOperationError';
+  }
+}
 
 export interface HeterogeneousPersistenceHandlerDeps {
   messageModel: MessageModel;
@@ -234,11 +244,16 @@ export class HeterogeneousPersistenceHandler {
    * the dedupe map, so the retry only re-runs the failed event onward.
    */
   async ingest(params: {
+    assistantMessageId?: string;
     events: AgentStreamEvent[];
     operationId: string;
     topicId: string;
   }): Promise<void> {
-    const state = await this.loadOrCreateState(params.operationId, params.topicId);
+    const state = await this.loadOrCreateState(
+      params.operationId,
+      params.topicId,
+      params.assistantMessageId,
+    );
     const batchMaxStepIndex = Math.max(...params.events.map((event) => event.stepIndex));
 
     // A different Lambda may have already processed `stream_start { newStep }`
@@ -269,8 +284,14 @@ export class HeterogeneousPersistenceHandler {
     // already read the message in `loadOrCreateState` — the second read is
     // redundant but harmless and keeps the logic uniform).
     const refreshed = await this.deps.messageModel.findById(state.currentAssistantMessageId);
-    const dbContent = (refreshed?.content ?? '') as string;
+    const rawDbContent = (refreshed?.content ?? '') as string;
+    const dbContent = rawDbContent === LOADING_FLAT ? '' : rawDbContent;
     const dbReasoning = (refreshed?.reasoning as { content?: string } | null)?.content ?? '';
+    const dbMetadata = ((refreshed?.metadata as Record<string, any> | null) ?? {}) as Record<
+      string,
+      any
+    >;
+    const dbTextSnapshotSeq = Number(dbMetadata.heteroTextSnapshotSeq ?? 0);
 
     // Adopt DB value only when it is LONGER than what this instance holds in memory.
     // This correctly handles two competing cases without introducing a dirty flag:
@@ -293,6 +314,56 @@ export class HeterogeneousPersistenceHandler {
     if (dbReasoning.length > state.accumulatedReasoning.length) {
       state.accumulatedReasoning = dbReasoning;
     }
+    if (Number.isFinite(dbTextSnapshotSeq) && dbTextSnapshotSeq > state.lastTextSnapshotSeq) {
+      state.lastTextSnapshotSeq = dbTextSnapshotSeq;
+      state.messageMetadata = dbMetadata;
+    } else if (
+      Object.keys(state.messageMetadata).length === 0 &&
+      Object.keys(dbMetadata).length > 0
+    ) {
+      state.messageMetadata = dbMetadata;
+    }
+
+    // Same multi-replica concern for `tools[]` and `lastModel`/`lastProvider`.
+    //
+    // Why this is necessary: `handleStepStart` computes the new assistant's
+    // parentId from `state.toolState.payloads` and copies model/provider from
+    // `state.lastModel` / `state.lastProvider`. Those are populated by
+    // `persistMainToolBatch` and `handleTurnMetadata` respectively — both
+    // run on whichever replica drains the relevant event. When the replica
+    // driving the next step boundary is NOT the one that drained the prior
+    // step's tools_calling / step_complete, the in-memory state is empty:
+    //   - parentId falls back to `state.currentAssistantMessageId`, so the
+    //     new turn chains off the previous assistant instead of the tool
+    //     message (observed in prod: 4/11 step boundaries in one topic).
+    //   - model/provider are written as null on the new assistant.
+    //
+    // Adopt the DB view as authoritative whenever it carries more resolved
+    // state than memory. `tools[]` is rewritten end-to-end on every Phase-3
+    // backfill, so it's safe to replace wholesale rather than merge by id —
+    // the same-batch transient where mem has a tool DB hasn't seen yet does
+    // not happen at refresh time (refresh runs before the event loop).
+    const dbTools = (refreshed?.tools ?? []) as ChatToolPayload[];
+    const dbResolvedToolCount = dbTools.filter((t) => !!t.result_msg_id).length;
+    const memResolvedToolCount = state.toolState.payloads.filter((t) => !!t.result_msg_id).length;
+    if (
+      dbTools.length > state.toolState.payloads.length ||
+      dbResolvedToolCount > memResolvedToolCount
+    ) {
+      state.toolState = {
+        payloads: [...dbTools],
+        // Only treat tool ids whose `result_msg_id` is already filled in as
+        // persisted. Phase 1 of `persistToolBatch` writes `tools[]` before
+        // creating the `role:'tool'` row (Phase 2), so a refresh that lands
+        // between the two would see an unresolved id. Marking that id as
+        // persisted would cause a subsequent retry of the same tools_calling
+        // event to skip the create (Phase 2) entirely — leaving the tool
+        // permanently without a tool message / result_msg_id.
+        persistedIds: new Set(dbTools.filter((t) => !!t.result_msg_id).map((t) => t.id)),
+      };
+    }
+    if (!state.lastModel && refreshed?.model) state.lastModel = refreshed.model;
+    if (!state.lastProvider && refreshed?.provider) state.lastProvider = refreshed.provider;
 
     for (const event of params.events) {
       const key = eventKey(event);
@@ -339,6 +410,17 @@ export class HeterogeneousPersistenceHandler {
       await this.flushFinalState(state, params.error, params.result);
       if (params.sessionId) {
         await this.persistSessionId(state.topicId, params.sessionId);
+      } else if (params.result === 'error') {
+        // No new session id was produced and the run failed. The most common
+        // cause in cloud sandboxes is `--resume <staleId>` failing because the
+        // container was recycled and session files are gone. Clear any persisted
+        // `heteroSessionId` so the next turn starts a fresh CC session instead
+        // of looping on the same stale id.
+        //
+        // When CC ran (system.init was emitted) but produced an error result,
+        // `params.sessionId` is set — so this branch is NOT reached and the
+        // valid session id is kept for resume on the next turn.
+        await this.clearSessionId(state.topicId);
       }
     } finally {
       operationStates.delete(params.operationId);
@@ -359,9 +441,28 @@ export class HeterogeneousPersistenceHandler {
     }
   }
 
+  /**
+   * Remove a stale `heteroSessionId` from topic metadata. Called when a run
+   * fails without producing a new session id (e.g. `--resume` rejected because
+   * the sandbox was recycled). Prevents the next turn from inheriting a session
+   * id that will never succeed.
+   */
+  private async clearSessionId(topicId: string): Promise<void> {
+    try {
+      await this.deps.topicModel.updateMetadata(topicId, { heteroSessionId: undefined });
+      log('cleared stale sessionId topic=%s', topicId);
+    } catch (err) {
+      log('clearSessionId failed topic=%s err=%O', topicId, err);
+    }
+  }
+
   // ─── State management ────────────────────────────────────────────────────
 
-  private async loadOrCreateState(operationId: string, topicId: string): Promise<OperationState> {
+  private async loadOrCreateState(
+    operationId: string,
+    topicId: string,
+    seedAssistantMessageId?: string,
+  ): Promise<OperationState> {
     let state = operationStates.get(operationId);
     if (state) {
       // Defensive: caller mismatch on topicId would corrupt persistence —
@@ -376,13 +477,44 @@ export class HeterogeneousPersistenceHandler {
 
     const topic = await this.deps.topicModel.findById(topicId);
     const running = topic?.metadata?.runningOperation;
-    if (!running || running.operationId !== operationId) {
-      throw new Error(
-        `No matching runningOperation on topic ${topicId} for operation ${operationId} — orchestrator must seed topic.metadata.runningOperation before ingest`,
+
+    if (!running) {
+      throw new StaleHeteroOperationError(
+        `Stale hetero operation ${operationId} on topic ${topicId}; no active runningOperation`,
       );
     }
-    if (!running.assistantMessageId) {
+
+    if (running.operationId !== operationId) {
+      throw new StaleHeteroOperationError(
+        `Stale hetero operation ${operationId} on topic ${topicId}; current operation is ${running.operationId}`,
+      );
+    }
+
+    // Prefer the assistantMessageId forwarded in the ingest payload (sandbox path).
+    // The orchestrator already has it in-memory and passes it through env → CLI → tRPC,
+    // so this path avoids depending on `runningOperation.assistantMessageId`
+    // itself being readable on this replica. We still require the topic's
+    // runningOperation binding to match `operationId`, otherwise late/retried
+    // batches after finish could keep mutating a completed turn.
+    // Fall back to topic.metadata for desktop / old-CLI callers that lack the field.
+    const baseAssistantMessageId = seedAssistantMessageId ?? running.assistantMessageId;
+
+    if (!baseAssistantMessageId) {
       throw new Error(`runningOperation on topic ${topicId} is missing assistantMessageId`);
+    }
+
+    if (seedAssistantMessageId) {
+      const seededMsg = await this.deps.messageModel.findById(seedAssistantMessageId);
+      if (!seededMsg) {
+        throw new Error(
+          `Seeded assistantMessageId ${seedAssistantMessageId} was not found for topic ${topicId}`,
+        );
+      }
+      if (seededMsg.topicId !== topicId) {
+        throw new Error(
+          `Seeded assistantMessageId ${seedAssistantMessageId} does not belong to topic ${topicId}`,
+        );
+      }
     }
 
     // Prefer the latest step's assistant message id (written by handleStepStart)
@@ -391,11 +523,11 @@ export class HeterogeneousPersistenceHandler {
     // Guard: only use heteroCurrentMsgId when it belongs to THIS operation.
     // A stale value from a previous run must not override the new operation's
     // seeded assistantMessageId (P1 fix).
-    const stored = topic.metadata?.heteroCurrentMsgId;
+    const stored = topic?.metadata?.heteroCurrentMsgId;
     const currentAssistantMessageId =
-      stored?.operationId === running.operationId
-        ? (stored.msgId ?? running.assistantMessageId)
-        : running.assistantMessageId;
+      stored?.operationId === operationId
+        ? (stored.msgId ?? baseAssistantMessageId)
+        : baseAssistantMessageId;
 
     // Restore toolMsgIdByCallId from the DB so tool_results that arrive on a
     // different replica than their tool_use can still be matched and persisted.
@@ -416,19 +548,36 @@ export class HeterogeneousPersistenceHandler {
     //     persisted tool messages, and overwrites assistant.tools[] with only the
     //     current batch's tools (losing all previous ones).
     const currentMsg = await this.deps.messageModel.findById(currentAssistantMessageId);
-    const restoredContent = (currentMsg?.content ?? '') as string;
+    // Skip LOADING_FLAT placeholder — it is the initial DB value before any
+    // content arrives and must not be treated as real accumulated text.
+    const rawContent = (currentMsg?.content ?? '') as string;
+    const restoredContent = rawContent === LOADING_FLAT ? '' : rawContent;
     const restoredReasoning = (currentMsg?.reasoning as { content?: string } | null)?.content ?? '';
+    const restoredMetadata = ((currentMsg?.metadata as Record<string, any> | null) ?? {}) as Record<
+      string,
+      any
+    >;
     const restoredTools = (currentMsg?.tools ?? []) as ChatToolPayload[];
-    const restoredPersistedIds = new Set(restoredTools.map((t) => t.id));
+    const restoredTextSnapshotSeq = Number(restoredMetadata.heteroTextSnapshotSeq ?? 0);
+    // Phase 1 of `persistToolBatch` writes `tools[]` BEFORE the tool message
+    // row is created (Phase 2 sets `result_msg_id`). Only ids that already
+    // carry a `result_msg_id` are truly persisted — restoring an unresolved
+    // id into `persistedIds` would make a retry of the same tools_calling
+    // event skip the Phase 2 create, orphaning the tool forever.
+    const restoredPersistedIds = new Set(
+      restoredTools.filter((t) => !!t.result_msg_id).map((t) => t.id),
+    );
 
     state = {
       accumulatedContent: restoredContent,
       accumulatedReasoning: restoredReasoning,
-      agentId: topic.agentId ?? null,
+      agentId: topic?.agentId ?? null,
       currentAssistantMessageId,
       lastModel: undefined,
       lastProvider: undefined,
       lastStepIndex: 0,
+      lastTextSnapshotSeq: Number.isFinite(restoredTextSnapshotSeq) ? restoredTextSnapshotSeq : 0,
+      messageMetadata: restoredMetadata,
       operationId,
       processedKeys: new Set(),
       subagentRuns: new Map(),
@@ -453,17 +602,17 @@ export class HeterogeneousPersistenceHandler {
     const topic = await this.deps.topicModel.findById(state.topicId);
     const running = topic?.metadata?.runningOperation;
 
-    if (!running || running.operationId !== state.operationId) {
-      throw new Error(
-        `No matching runningOperation on topic ${state.topicId} for operation ${state.operationId} — orchestrator must seed topic.metadata.runningOperation before ingest`,
+    if (running && running.operationId !== state.operationId) {
+      throw new StaleHeteroOperationError(
+        `Stale hetero operation ${state.operationId} on topic ${state.topicId}; current operation is ${running.operationId}`,
       );
     }
 
-    const stored = topic.metadata?.heteroCurrentMsgId;
+    const stored = topic?.metadata?.heteroCurrentMsgId;
     const authoritativeAssistantMessageId =
       stored?.operationId === state.operationId
-        ? (stored.msgId ?? running.assistantMessageId)
-        : running.assistantMessageId;
+        ? (stored.msgId ?? running?.assistantMessageId)
+        : running?.assistantMessageId;
 
     if (
       !authoritativeAssistantMessageId ||
@@ -475,14 +624,29 @@ export class HeterogeneousPersistenceHandler {
     const currentMsg = await this.deps.messageModel.findById(authoritativeAssistantMessageId);
     const restoredContent = (currentMsg?.content ?? '') as string;
     const restoredReasoning = (currentMsg?.reasoning as { content?: string } | null)?.content ?? '';
+    const restoredMetadata = ((currentMsg?.metadata as Record<string, any> | null) ?? {}) as Record<
+      string,
+      any
+    >;
     const restoredTools = (currentMsg?.tools ?? []) as ChatToolPayload[];
+    const restoredTextSnapshotSeq = Number(restoredMetadata.heteroTextSnapshotSeq ?? 0);
 
     state.currentAssistantMessageId = authoritativeAssistantMessageId;
     state.accumulatedContent = restoredContent;
     state.accumulatedReasoning = restoredReasoning;
+    state.lastTextSnapshotSeq = Number.isFinite(restoredTextSnapshotSeq)
+      ? restoredTextSnapshotSeq
+      : 0;
+    state.messageMetadata = restoredMetadata;
     state.toolState = {
       payloads: restoredTools,
-      persistedIds: new Set(restoredTools.map((tool) => tool.id)),
+      // Same `persistedIds` invariant as `loadOrCreateState`: only ids with a
+      // backfilled `result_msg_id` count as persisted. An unresolved id (Phase
+      // 1 written, Phase 2 not yet) must remain re-createable so a retry on
+      // this replica can complete the tool message.
+      persistedIds: new Set(
+        restoredTools.filter((tool) => !!tool.result_msg_id).map((tool) => tool.id),
+      ),
     };
 
     log(
@@ -541,11 +705,22 @@ export class HeterogeneousPersistenceHandler {
     const { model, provider, usage } = event.data ?? {};
     if (model) state.lastModel = model;
     if (provider) state.lastProvider = provider;
-    if (!usage) return;
 
-    await this.deps.messageModel.update(state.currentAssistantMessageId, {
-      metadata: { usage },
-    });
+    // Persist model/provider/usage to DB so a replica that didn't drain this
+    // event can still recover lastModel/lastProvider via the ingest-refresh
+    // path. Previously only `metadata.usage` was written, which left
+    // model/provider in-memory only — and the next step boundary on a
+    // different replica created assistants with model=null/provider=null.
+    const update: Record<string, any> = {};
+    if (usage) {
+      state.messageMetadata = { ...state.messageMetadata, usage };
+      update.metadata = state.messageMetadata;
+    }
+    if (model) update.model = model;
+    if (provider) update.provider = provider;
+    if (Object.keys(update).length === 0) return;
+
+    await this.deps.messageModel.update(state.currentAssistantMessageId, update);
   }
 
   /**
@@ -598,6 +773,8 @@ export class HeterogeneousPersistenceHandler {
     state.currentAssistantMessageId = newMsg.id;
     state.accumulatedContent = '';
     state.accumulatedReasoning = '';
+    state.lastTextSnapshotSeq = 0;
+    state.messageMetadata = {};
     state.toolState = { payloads: [], persistedIds: new Set() };
   }
 
@@ -609,7 +786,29 @@ export class HeterogeneousPersistenceHandler {
       if (subagentCtx) {
         await this.persistSubagentText(state, subagentCtx, 'text', chunk.content);
       } else {
-        state.accumulatedContent += chunk.content;
+        const snapshotMode = chunk.snapshotMode;
+        const snapshotSeq =
+          typeof chunk.snapshotSeq === 'number' ? Number(chunk.snapshotSeq) : undefined;
+
+        if (snapshotMode === 'replace' && snapshotSeq !== undefined) {
+          if (snapshotSeq <= state.lastTextSnapshotSeq) {
+            log(
+              'skip stale text snapshot op=%s seq=%d current=%d',
+              state.operationId,
+              snapshotSeq,
+              state.lastTextSnapshotSeq,
+            );
+            return;
+          }
+          state.lastTextSnapshotSeq = snapshotSeq;
+          state.messageMetadata = {
+            ...state.messageMetadata,
+            heteroTextSnapshotSeq: snapshotSeq,
+          };
+          state.accumulatedContent = chunk.content;
+        } else {
+          state.accumulatedContent += chunk.content;
+        }
       }
       return;
     }
@@ -747,6 +946,7 @@ export class HeterogeneousPersistenceHandler {
     const update: Record<string, any> = {};
     if (state.accumulatedContent) update.content = state.accumulatedContent;
     if (state.accumulatedReasoning) update.reasoning = { content: state.accumulatedReasoning };
+    if (Object.keys(state.messageMetadata).length > 0) update.metadata = state.messageMetadata;
     await this.deps.messageModel.update(state.currentAssistantMessageId, update);
   }
 

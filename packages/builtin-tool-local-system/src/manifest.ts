@@ -7,6 +7,7 @@ export const LocalSystemManifest: BuiltinToolManifest = {
   executors: ['client', 'server'],
   api: [
     {
+      defaultTimeoutMs: 30_000,
       description:
         'List files and folders in a specified directory. Input should be a path. Output is a JSON array of file/folder names.',
       humanIntervention: {
@@ -46,6 +47,7 @@ export const LocalSystemManifest: BuiltinToolManifest = {
       },
     },
     {
+      defaultTimeoutMs: 30_000,
       description:
         'Read the content of a text or document file (txt/md/json/source code/pdf/docx/etc.). Binary files (.bin/.exe/.zip/.b64/encoded blobs) are rejected with a structured error — use runCommand with file/hexdump/strings to inspect those instead. Output is capped at 500K chars total and 8K chars per line; for larger files, use a narrower line range or grepContent.',
       humanIntervention: {
@@ -76,6 +78,7 @@ export const LocalSystemManifest: BuiltinToolManifest = {
       },
     },
     {
+      defaultTimeoutMs: 60_000,
       description:
         'Search for files within the workspace based on a query string and optional filter options. Input should include the search query and any filter options. Output is a JSON array of matching file paths.',
       humanIntervention: {
@@ -160,6 +163,7 @@ export const LocalSystemManifest: BuiltinToolManifest = {
       },
     },
     {
+      defaultTimeoutMs: 60_000,
       description:
         'Moves or renames multiple files/directories. Input is an array of objects, each containing an oldPath and a newPath.',
       humanIntervention: {
@@ -197,6 +201,7 @@ export const LocalSystemManifest: BuiltinToolManifest = {
       },
     },
     {
+      defaultTimeoutMs: 30_000,
       description:
         'Write content to a specific file. Input should be the file path and content. Overwrites existing file or creates a new one.',
       humanIntervention: {
@@ -223,6 +228,7 @@ export const LocalSystemManifest: BuiltinToolManifest = {
       },
     },
     {
+      defaultTimeoutMs: 30_000,
       description:
         'Perform exact string replacements in files. Must read the file first before editing.',
       humanIntervention: {
@@ -257,8 +263,9 @@ export const LocalSystemManifest: BuiltinToolManifest = {
       },
     },
     {
+      defaultTimeoutMs: 30_000,
       description:
-        'Execute a shell command and return its output. Supports both synchronous and background execution with timeout control.',
+        'Start a terminal session to execute a shell command and return console output collected during the wait window. If the command exits during that window, the result includes `exit_code`; if it is still running, the result includes `shell_id` for later output retrieval or termination.',
       humanIntervention: 'required',
       name: LocalSystemApiName.runCommand,
       parameters: {
@@ -279,12 +286,9 @@ export const LocalSystemManifest: BuiltinToolManifest = {
             type: 'object',
           },
           run_in_background: {
-            description: 'Set to true to run command in background and return shell_id',
+            description:
+              'Set to true to return immediately after starting the terminal session. The result will include a `shell_id` for later observation or termination.',
             type: 'boolean',
-          },
-          timeout: {
-            description: 'Timeout in milliseconds (default: 120000ms, max: 600000ms)',
-            type: 'number',
           },
         },
         required: ['description', 'command'],
@@ -292,6 +296,7 @@ export const LocalSystemManifest: BuiltinToolManifest = {
       },
     },
     {
+      defaultTimeoutMs: 30_000,
       description:
         'Retrieve output from a running or completed background shell command. Returns only new output since the last check.',
       name: LocalSystemApiName.getCommandOutput,
@@ -312,6 +317,7 @@ export const LocalSystemManifest: BuiltinToolManifest = {
       },
     },
     {
+      defaultTimeoutMs: 10_000,
       description: 'Kill a running background shell command by its ID.',
       name: LocalSystemApiName.killCommand,
       parameters: {
@@ -326,6 +332,7 @@ export const LocalSystemManifest: BuiltinToolManifest = {
       },
     },
     {
+      defaultTimeoutMs: 60_000,
       description:
         'Search for content within files using regex patterns. Supports various output modes and filtering options.',
       humanIntervention: {
@@ -398,6 +405,7 @@ export const LocalSystemManifest: BuiltinToolManifest = {
       },
     },
     {
+      defaultTimeoutMs: 60_000,
       description:
         'Find files matching glob patterns. Supports standard glob syntax like "**/*.js" or "src/**/*.ts".',
       humanIntervention: {

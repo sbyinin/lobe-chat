@@ -4,15 +4,8 @@ import { Avatar, Block, Flexbox, Icon, Text } from '@lobehub/ui';
 import { type ItemType } from 'antd/es/menu/interface';
 import { useTheme } from 'antd-style';
 import isEqual from 'fast-deep-equal';
-import {
-  ActivityIcon,
-  BookTextIcon,
-  BrainIcon,
-  MessageSquareHeartIcon,
-  MessagesSquareIcon,
-  UserIcon,
-} from 'lucide-react';
-import { memo, useMemo, useState } from 'react';
+import { ActivityIcon, MessageSquareHeartIcon } from 'lucide-react';
+import { memo, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { shallow } from 'zustand/shallow';
 
@@ -34,7 +27,22 @@ const Content = memo(() => {
   const config = useAgentStore(agentSelectors.currentAgentConfig, isEqual);
   const meta = useAgentStore(agentSelectors.currentAgentMeta, isEqual);
   const { enableAgentSelfIteration } = useServerConfigStore(featureFlagsSelectors);
-  const [tab, setTab] = useState(isInbox ? ChatSettingsTabs.Modal : ChatSettingsTabs.Meta);
+  const [tab, setTab] = useState(ChatSettingsTabs.Opening);
+
+  const availableTabs = useMemo(
+    () =>
+      [
+        !isInbox ? ChatSettingsTabs.Opening : null,
+        enableAgentSelfIteration ? ChatSettingsTabs.SelfIteration : null,
+      ].filter(Boolean) as ChatSettingsTabs[],
+    [isInbox, enableAgentSelfIteration],
+  );
+
+  const activeTab = availableTabs.includes(tab) ? tab : availableTabs[0];
+
+  useEffect(() => {
+    if (activeTab && activeTab !== tab) setTab(activeTab);
+  }, [activeTab, tab]);
 
   const updateAgentConfig = async (config: any) => {
     if (!agentId) return;
@@ -48,45 +56,30 @@ const Content = memo(() => {
 
   const menuItems: ItemType[] = useMemo(
     () =>
-      [
-        !isInbox
-          ? {
-              icon: <Icon icon={UserIcon} />,
-              key: ChatSettingsTabs.Meta,
-              label: t('agentTab.meta'),
+      availableTabs
+        .map((tab) => {
+          switch (tab) {
+            case ChatSettingsTabs.Opening: {
+              return {
+                icon: <Icon icon={MessageSquareHeartIcon} />,
+                key: ChatSettingsTabs.Opening,
+                label: t('agentTab.opening'),
+              };
             }
-          : null,
-        !isInbox
-          ? {
-              icon: <Icon icon={MessageSquareHeartIcon} />,
-              key: ChatSettingsTabs.Opening,
-              label: t('agentTab.opening'),
+            case ChatSettingsTabs.SelfIteration: {
+              return {
+                icon: <Icon icon={ActivityIcon} />,
+                key: ChatSettingsTabs.SelfIteration,
+                label: t('agentTab.selfIteration'),
+              };
             }
-          : null,
-        {
-          icon: <Icon icon={BookTextIcon} />,
-          key: ChatSettingsTabs.Documents,
-          label: t('agentTab.documents'),
-        },
-        {
-          icon: <Icon icon={MessagesSquareIcon} />,
-          key: ChatSettingsTabs.Chat,
-          label: t('agentTab.chat'),
-        },
-        {
-          icon: <Icon icon={BrainIcon} />,
-          key: ChatSettingsTabs.Modal,
-          label: t('agentTab.modal'),
-        },
-        enableAgentSelfIteration
-          ? {
-              icon: <Icon icon={ActivityIcon} />,
-              key: ChatSettingsTabs.SelfIteration,
-              label: t('agentTab.selfIteration'),
+            default: {
+              return null;
             }
-          : null,
-      ].filter(Boolean) as ItemType[],
-    [t, isInbox, enableAgentSelfIteration],
+          }
+        })
+        .filter(Boolean) as ItemType[],
+    [availableTabs, t],
   );
 
   const displayTitle = isInbox ? 'Lobe AI' : meta.title || t('defaultSession', { ns: 'common' });
@@ -134,7 +127,7 @@ const Content = memo(() => {
         <Menu
           selectable
           items={menuItems}
-          selectedKeys={[tab]}
+          selectedKeys={activeTab ? [activeTab] : []}
           style={{ width: '100%' }}
           onClick={({ key }) => setTab(key as ChatSettingsTabs)}
         />
@@ -145,15 +138,17 @@ const Content = memo(() => {
         paddingInline={64}
         style={{ overflow: 'scroll', width: '100%' }}
       >
-        <Settings
-          config={config}
-          id={agentId}
-          loading={false}
-          meta={meta}
-          tab={tab}
-          onConfigChange={updateAgentConfig}
-          onMetaChange={updateAgentMeta}
-        />
+        {activeTab && (
+          <Settings
+            config={config}
+            id={agentId}
+            loading={false}
+            meta={meta}
+            tab={activeTab}
+            onConfigChange={updateAgentConfig}
+            onMetaChange={updateAgentMeta}
+          />
+        )}
       </Flexbox>
     </Flexbox>
   );

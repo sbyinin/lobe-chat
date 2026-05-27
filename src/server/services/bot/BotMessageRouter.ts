@@ -21,6 +21,7 @@ import {
   peekPairingRequest,
   releasePairingClaim,
 } from './dmPairingStore';
+import { submitBotFeedback } from './feedbackSubmit';
 import {
   type BotPlatformRuntimeContext,
   type BotReplyLocale,
@@ -53,6 +54,7 @@ import {
   renderDmPairing,
   renderDmRejected,
   renderError,
+  renderFeedbackSubmitted,
   renderGroupRejected,
   renderInlineError,
   renderSenderRejected,
@@ -114,6 +116,22 @@ interface CommandContext {
    *  surface only the ID, not a friendly label. */
   authorUserName?: string;
   post: (text: string) => Promise<any>;
+  /**
+   * Post a reply visible only to the invoker.
+   *
+   * Set only on native-slash paths (Slack / Discord) where chat-sdk knows
+   * the interaction context — Slack uses native ephemeral, Discord uses an
+   * ephemeral interaction response, both fall back to a DM if needed
+   * (`fallbackToDM: true`). Undefined on text-based platforms (Telegram,
+   * Feishu) — handlers should fall back to `post` there since those
+   * platforms have no per-user ephemeral primitive.
+   *
+   * Used by `/feedback` so the user's feedback text and the bot's
+   * confirmation don't leak into the public channel; other commands keep
+   * using `post` to preserve the existing channel-visible behaviour
+   * (e.g. `/new` resetting is useful for everyone to see).
+   */
+  postEphemeral?: (text: string) => Promise<any>;
   /** Locale to use for any system-generated reply text. Plumbed in by the
    *  caller — text-based commands derive it per-message via the platform's
    *  `extractAuthorLocale`, native slash commands fall back to the platform
@@ -304,6 +322,7 @@ export class BotMessageRouter {
     const runtimeContext: BotPlatformRuntimeContext = {
       appUrl: appEnv.APP_URL,
       redisClient: getAgentRuntimeRedisClient() as any,
+      userId,
     };
 
     const client = entry.clientFactory.createClient(providerConfig, runtimeContext);
@@ -524,7 +543,7 @@ export class BotMessageRouter {
     const groupSettings: GroupSettings = extractGroupSettings(info.settings);
     const userAllowlist: UserAllowlist = extractUserAllowlist(info.settings);
     /**
-     * Operator-configured keywords (LOBE-8891). When non-empty, a non-@mention
+     * Operator-configured keywords (). When non-empty, a non-@mention
      * non-command message in a subscribed group thread still wakes the bot if
      * its text contains any keyword — case-insensitive, word-boundary aware
      * (see `messageMatchesWatchKeyword`). Empty list keeps the legacy
@@ -869,8 +888,59 @@ export class BotMessageRouter {
       return false;
     };
 
+    // single-user thread relaxation. A subscribed channel thread
+    // with only one human follower is effectively a private 1:1 with the
+    // bot, so we drop the @mention requirement for follow-ups. Once a
+    // second human posts we revert to mention-only mode and announce the
+    // switch once so participants understand why the bot went quiet.
+    // Mirrors `MessengerRouter`'s implementation — see that file for the
+    // shared rationale.
+    const PARTICIPANTS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+    const participantsKey = (threadId: string): string => `messenger:thread-humans:${threadId}`;
+    const mentionRequiredAnnouncedKey = (threadId: string): string =>
+      `messenger:thread-mention-required-announced:${threadId}`;
+
+    const trackThreadParticipant = async (
+      thread: { id: string; isDM?: boolean },
+      message: Message,
+    ): Promise<{ count: number; isNewParticipant: boolean }> => {
+      if (thread.isDM) return { count: 0, isNewParticipant: false };
+      const senderId = message.author?.userId;
+      const isHuman =
+        !!senderId &&
+        message.author?.isBot !== true &&
+        (message.author as { isMe?: boolean })?.isMe !== true;
+      if (!isHuman) return { count: 0, isNewParticipant: false };
+
+      const stateAdapter = bot.getState();
+      const key = participantsKey(thread.id);
+      let participants: string[] = [];
+      try {
+        participants = (await stateAdapter.getList<string>(key)) ?? [];
+      } catch (error) {
+        log('trackThreadParticipant: getList failed: %O', error);
+      }
+      if (participants.includes(senderId)) {
+        return { count: participants.length, isNewParticipant: false };
+      }
+      try {
+        await stateAdapter.appendToList(key, senderId, {
+          maxLength: 50,
+          ttlMs: PARTICIPANTS_TTL_MS,
+        });
+      } catch (error) {
+        log('trackThreadParticipant: appendToList failed: %O', error);
+      }
+      return { count: participants.length + 1, isNewParticipant: true };
+    };
+
     bot.onNewMention(async (thread, message, context?: MessageContext) => {
       const replyLocale = detectReplyLocale(message);
+      // Record the original @mentioner so the first follow-up in
+      // `onSubscribedMessage` recognises them as participant #1 instead of
+      // a "newcomer" — otherwise count would be 0 at that moment and the
+      // single-user-relaxation logic wouldn't kick in.
+      await trackThreadParticipant(thread, message);
 
       // Gate first — must run before tryDispatch so a /command from a
       // non-allowlisted sender can't slip through and side-effect.
@@ -974,12 +1044,21 @@ export class BotMessageRouter {
       // Commands are exempt from the @-mention requirement (Telegram/Feishu users
       // type `/new` directly without mentioning the bot), but they are NOT exempt
       // from the access gates below.
+      //
+      // a subscribed channel thread with only one human follower
+      // is functionally a private 1:1 with the bot, so the @mention
+      // requirement is dropped while `count <= 1`. Tracked + counted here
+      // regardless of which exemption ultimately fires so the
+      // 1-human-vs-many transition is visible to the announcement gate.
+      const { count: humanCount } = await trackThreadParticipant(thread, message);
+      const isSingleHumanThread = humanCount <= 1;
       const isAddressedToBot =
         thread.isDM ||
         message.isMention === true ||
-        context?.skipped?.some((m) => m.isMention === true) === true;
+        context?.skipped?.some((m) => m.isMention === true) === true ||
+        isSingleHumanThread;
       const isCommand = looksLikeCommand(message.text);
-      // LOBE-8891: operator-configured keyword match also wakes the bot in a
+      // operator-configured keyword match also wakes the bot in a
       // subscribed group thread. Skipped (debounced) siblings are inspected
       // too so a keyword queued behind a non-trigger still fires — same
       // pattern as the mention check above.
@@ -997,6 +1076,23 @@ export class BotMessageRouter {
           message.author.userName,
           thread.id,
         );
+        // first skip in this thread → tell participants the bot
+        // is now mention-only so newcomers don't think it broke. Dedupe by
+        // thread id so we never announce more than once.
+        if (!thread.isDM && humanCount >= 2) {
+          try {
+            const fresh = await bot
+              .getState()
+              .setIfNotExists(mentionRequiredAnnouncedKey(thread.id), '1', PARTICIPANTS_TTL_MS);
+            if (fresh) {
+              await thread.post(
+                "Multiple people are talking in this thread now. From here on I'll only respond when you @mention me.",
+              );
+            }
+          } catch (error) {
+            log('onSubscribedMessage: mention-mode announcement failed: %O', error);
+          }
+        }
         return;
       }
 
@@ -1040,7 +1136,7 @@ export class BotMessageRouter {
       }
 
       let merged = BotMessageRouter.mergeSkippedMessages(message, context);
-      // LOBE-8891: when a keyword (and not a mention / DM / command) is what
+      // when a keyword (and not a mention / DM / command) is what
       // wakes the bot, prepend the matched entries' operator-authored
       // instructions to the user message so the agent gets a directive
       // rather than only the raw chatter. Mentions, DMs, and commands are
@@ -1141,7 +1237,7 @@ export class BotMessageRouter {
     // regex listener can serve both:
     //
     //   • DM path: every message in a DM thread (when DM policy allows it).
-    //   • Channel keyword path (LOBE-8891): non-DM messages whose text — or
+    //   • Channel keyword path (): non-DM messages whose text — or
     //     a debounced sibling's text — contains a configured watch keyword.
     //     This is the only way to wake the bot in a parent channel on
     //     platforms like Discord, where `shouldSubscribe` returns false for
@@ -1225,7 +1321,7 @@ export class BotMessageRouter {
         }
 
         let merged = BotMessageRouter.mergeSkippedMessages(message, context);
-        // LOBE-8891: same instruction-injection rule as `onSubscribedMessage`
+        // same instruction-injection rule as `onSubscribedMessage`
         // — prepend the matched entries' operator-authored instructions when
         // the keyword (not a mention / DM / command) is what wakes the bot.
         // DMs are explicit user intent and never get the prefix.
@@ -1546,6 +1642,47 @@ export class BotMessageRouter {
         },
         name: 'approve',
       },
+      {
+        description: 'Send feedback directly to the LobeHub team (no AI reply)',
+        // Declaring the argument so Discord/Slack surface a `/feedback <message>`
+        // prompt instead of registering the command as zero-arg (see the
+        // `options` comment on the BotCommand interface).
+        options: [
+          {
+            description: 'Your feedback message',
+            name: 'message',
+            required: true,
+          },
+        ],
+        handler: async (ctx) => {
+          log('command /feedback: agent=%s, platform=%s', agentId, platform);
+          // Prefer the ephemeral channel when available (Slack / Discord
+          // native slash) so the user's feedback content and the bot's
+          // confirmation never leak into the public channel. Text-based
+          // platforms (Telegram, Feishu) have no ephemeral primitive, so
+          // we fall back to a regular post — those platforms are DM-first
+          // anyway, so the privacy concern is much smaller.
+          const reply = ctx.postEphemeral ?? ctx.post;
+          const body = ctx.args.trim();
+          if (!body) {
+            await reply(renderCommandReply('cmdFeedbackUsage', ctx.replyLocale));
+            return;
+          }
+          const result = await submitBotFeedback(serverDB, {
+            applicationId,
+            body,
+            platform,
+            threadId: ctx.threadId,
+            userId,
+          });
+          if (!result.success) {
+            await reply(renderCommandReply('cmdFeedbackError', ctx.replyLocale));
+            return;
+          }
+          await reply(renderFeedbackSubmitted(result.issueUrl, ctx.replyLocale));
+        },
+        name: 'feedback',
+      },
     ];
   }
 
@@ -1619,6 +1756,16 @@ export class BotMessageRouter {
           authorUserId: authorLike.userId,
           authorUserName: authorLike.userName,
           post: (text) => event.channel.post(text),
+          // Wire chat-sdk's `postEphemeral` so commands that want a private
+          // reply (e.g. `/feedback`) can opt in. `fallbackToDM: true` so
+          // Discord — which has no channel-level ephemeral outside of an
+          // interaction response — still delivers privately by DMing the
+          // user instead of broadcasting to the channel. Wrapped here, not
+          // in the handler, so commands stay platform-agnostic.
+          postEphemeral: event.user
+            ? (text: string) =>
+                event.channel.postEphemeral(event.user!, text, { fallbackToDM: true })
+            : undefined,
           // Native slash-command events don't carry a Chat SDK Message, so
           // there's no per-sender locale field to read; use the channel
           // default. Telegram/Feishu/etc. dispatch via the text-based path

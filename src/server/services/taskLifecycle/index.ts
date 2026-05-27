@@ -1,10 +1,18 @@
+import { TRACING_SCENARIOS } from '@lobechat/const';
+import type { TracingOptions } from '@lobechat/llm-generation-tracing';
 import {
   chainGenerateBrief,
   chainJudgeBriefEmit,
   chainTaskTopicHandoff,
+  GENERATE_BRIEF_PROMPT_VERSION,
   GENERATE_BRIEF_SCHEMA,
+  GENERATE_BRIEF_SCHEMA_NAME,
+  JUDGE_BRIEF_EMIT_PROMPT_VERSION,
   JUDGE_BRIEF_EMIT_SCHEMA,
+  JUDGE_BRIEF_EMIT_SCHEMA_NAME,
+  TASK_TOPIC_HANDOFF_PROMPT_VERSION,
   TASK_TOPIC_HANDOFF_SCHEMA,
+  TASK_TOPIC_HANDOFF_SCHEMA_NAME,
 } from '@lobechat/prompts';
 import type {
   BriefArtifacts,
@@ -51,7 +59,7 @@ const TERMINAL_STATUSES = new Set(['canceled', 'completed', 'failed']);
 const isTerminal = (status: string) => TERMINAL_STATUSES.has(status);
 
 // Consecutive 'error' reasons after which we stop re-arming and let the
-// urgent brief surface for human attention. Hardcoded for now (per LOBE-8233);
+// urgent brief surface for human attention. Hardcoded for now (per );
 // move to task.config later if it needs to be tunable per-task.
 const HEARTBEAT_FAILURE_FUSE = 3;
 
@@ -135,7 +143,7 @@ export class TaskLifecycleService {
 
       // 4. Synthesize a programmatic brief for the user (auto mode only).
       //    The agent-driven `createBrief` tool path stays the default until
-      //    the GrowthBook flag flips. See LOBE-8333 for the rollout plan.
+      //    the GrowthBook flag flips. See for the rollout plan.
       if (getBriefMode(currentTask) === 'auto' && currentTask && topicId && lastAssistantContent) {
         await this.synthesizeTopicBrief(
           taskId,
@@ -148,17 +156,30 @@ export class TaskLifecycleService {
       }
 
       // 5. Default post-tick transition.
-      //    - Automation tasks (heartbeat / schedule) loop running ↔ scheduled, so
-      //      a successful tick parks the task at 'scheduled' to wait for the next
-      //      tick. They never auto-pause on success — only `reason === 'error'`
-      //      below puts them in 'paused' for human attention.
-      //    - Non-automation tasks fall back to the legacy "pause for user review"
-      //      behavior: a 'result' brief from the agent is a *proposal* of
-      //      completion, and the user must explicitly approve via the brief action
-      //      to transition to 'completed'. Auto-complete only happens via the
-      //      Judge path above.
+      //    - Schedule-mode task that just consumed its final allowed run
+      //      (count ≥ maxExecutions) → park at 'completed' so the UI reflects
+      //      the cap immediately. Without this, a daily cron with
+      //      maxExecutions=1 would advertise itself as 'scheduled' for
+      //      another 24h before the pre-tick check in runScheduleTick
+      //      noticed.
+      //    - Other automation tasks (heartbeat, schedule under cap) loop
+      //      running ↔ scheduled, so a successful tick parks them at
+      //      'scheduled' to wait for the next tick. They never auto-pause
+      //      on success — only `reason === 'error'` below puts them in
+      //      'paused' for human attention.
+      //    - Non-automation tasks fall back to the legacy "pause for user
+      //      review" behavior: a 'result' brief from the agent is a
+      //      *proposal* of completion, and the user must explicitly approve
+      //      via the brief action to transition to 'completed'. Auto-complete
+      //      only happens via the Judge path above.
       if (currentTask) {
-        if (currentTask.automationMode) {
+        if (
+          currentTask.automationMode === 'schedule' &&
+          (await this.scheduleCapReached(currentTask))
+        ) {
+          log('cap reached for task=%s — marking completed post-tick', taskIdentifier);
+          await this.taskModel.updateStatus(taskId, 'completed', { completedAt: new Date() });
+        } else if (currentTask.automationMode) {
           await this.taskModel.updateStatus(taskId, 'scheduled', { error: null });
         } else if (this.taskModel.shouldPauseOnTopicComplete(currentTask)) {
           await this.taskModel.updateStatus(taskId, 'paused', { error: null });
@@ -189,6 +210,41 @@ export class TaskLifecycleService {
     // next tick.
     const finalTask = await this.taskModel.findById(taskId);
     if (finalTask) await this.maybeRearmHeartbeat(finalTask, reason);
+  }
+
+  /**
+   * Has the task already consumed every allowed scheduled execution?
+   *
+   * Counts `task_topics` rows created since `context.scheduler.scheduleStartedAt`
+   * (stamped by `TaskService.updateStatus` on user-initiated start/restart) and
+   * compares against `config.schedule.maxExecutions`. Returns false when:
+   *   - the task isn't in schedule mode
+   *   - no cap is configured (null / 0)
+   *   - no `scheduleStartedAt` is stamped (pre-PR tasks fall through; enforcement
+   *     begins only after the user pauses + restarts)
+   *
+   * Mirrors the pre-tick check in `runScheduleTick` so a daily cron with
+   * `maxExecutions=1` doesn't sit in `scheduled` for 24h after consuming
+   * its single allowed run.
+   */
+  private async scheduleCapReached(task: TaskItem): Promise<boolean> {
+    if (task.automationMode !== 'schedule') return false;
+    const scheduleConfig =
+      ((task.config as { schedule?: { maxExecutions?: number | null } } | null) ?? {}).schedule ??
+      {};
+    const maxExecutions = scheduleConfig.maxExecutions ?? null;
+    if (maxExecutions == null || maxExecutions <= 0) return false;
+
+    const scheduler =
+      ((task.context as { scheduler?: { scheduleStartedAt?: string } } | null) ?? {}).scheduler ??
+      {};
+    const startedAtIso = scheduler.scheduleStartedAt;
+    if (!startedAtIso) return false;
+
+    const runCount = await this.taskTopicModel.countByTask(task.id, {
+      since: new Date(startedAtIso),
+    });
+    return runCount >= maxExecutions;
   }
 
   /**
@@ -303,9 +359,16 @@ export class TaskLifecycleService {
         {
           messages: payload.messages as any[],
           model,
-          schema: { name: 'task_topic_handoff', schema: TASK_TOPIC_HANDOFF_SCHEMA },
+          schema: { name: TASK_TOPIC_HANDOFF_SCHEMA_NAME, schema: TASK_TOPIC_HANDOFF_SCHEMA },
         },
-        { metadata: { trigger: 'task-handoff' } },
+        {
+          metadata: { trigger: 'task_handoff' },
+          tracing: {
+            promptVersion: TASK_TOPIC_HANDOFF_PROMPT_VERSION,
+            scenario: TRACING_SCENARIOS.TaskHandoff,
+            schemaName: TASK_TOPIC_HANDOFF_SCHEMA_NAME,
+          } satisfies TracingOptions,
+        },
       );
 
       const handoff = result as {
@@ -403,9 +466,16 @@ export class TaskLifecycleService {
           {
             messages: judgePayload.messages as any[],
             model,
-            schema: { name: 'task_topic_brief_judge', schema: JUDGE_BRIEF_EMIT_SCHEMA },
+            schema: { name: JUDGE_BRIEF_EMIT_SCHEMA_NAME, schema: JUDGE_BRIEF_EMIT_SCHEMA },
           },
-          { metadata: { trigger: 'task-brief-judge' } },
+          {
+            metadata: { trigger: 'task_brief_judge' },
+            tracing: {
+              promptVersion: JUDGE_BRIEF_EMIT_PROMPT_VERSION,
+              scenario: TRACING_SCENARIOS.TaskBriefJudge,
+              schemaName: JUDGE_BRIEF_EMIT_SCHEMA_NAME,
+            } satisfies TracingOptions,
+          },
         )) as { emit?: boolean; reason?: string };
 
         decision = {
@@ -456,9 +526,16 @@ export class TaskLifecycleService {
         {
           messages: payload.messages as any[],
           model,
-          schema: { name: 'task_topic_brief', schema: GENERATE_BRIEF_SCHEMA },
+          schema: { name: GENERATE_BRIEF_SCHEMA_NAME, schema: GENERATE_BRIEF_SCHEMA },
         },
-        { metadata: { trigger: 'task-brief' } },
+        {
+          metadata: { trigger: 'task_brief' },
+          tracing: {
+            promptVersion: GENERATE_BRIEF_PROMPT_VERSION,
+            scenario: TRACING_SCENARIOS.TaskBrief,
+            schemaName: GENERATE_BRIEF_SCHEMA_NAME,
+          } satisfies TracingOptions,
+        },
       );
 
       const generated = result as { summary?: string; title?: string };
